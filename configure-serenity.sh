@@ -16,10 +16,8 @@ fi
 	--disable-auth-digest \
 	--disable-auth_basic \
 	--disable-auth-form \
-	--disable-authz-host \
 	--disable-authz-groupfile \
 	--disable-authz-user \
-	--disable-authz-core \
 	--disable-authz-dbm \
 	--disable-authz-owner \
 	--disable-authz-dbd \
@@ -64,6 +62,8 @@ fi
 	--disable-cache_socache \
 	--disable-include \
 	--disable-remoteip \
+	--enable-authz-host \
+	--enable-authz-core \
 	--enable-ssl \
 	--enable-ssl-staticlib-deps \
 	--enable-socache-shmcb \
