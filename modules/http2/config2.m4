@@ -26,22 +26,23 @@ h2_config.lo dnl
 h2_conn.lo dnl
 h2_conn_io.lo dnl
 h2_ctx.lo dnl
+h2_filter.lo dnl
 h2_from_h1.lo dnl
 h2_h2.lo dnl
+h2_int_queue.lo dnl
 h2_io.lo dnl
 h2_io_set.lo dnl
 h2_mplx.lo dnl
+h2_ngn_shed.lo dnl
 h2_push.lo dnl
 h2_request.lo dnl
 h2_response.lo dnl
 h2_session.lo dnl
 h2_stream.lo dnl
-h2_stream_set.lo dnl
 h2_switch.lo dnl
 h2_task.lo dnl
 h2_task_input.lo dnl
 h2_task_output.lo dnl
-h2_task_queue.lo dnl
 h2_util.lo dnl
 h2_worker.lo dnl
 h2_workers.lo dnl
@@ -155,8 +156,10 @@ AC_DEFUN([APACHE_CHECK_NGHTTP2],[
         AC_MSG_WARN([nghttp2 library is unusable])
       fi
 dnl # nghttp2 >= 1.3.0: access to stream weights
-      AC_CHECK_FUNCS([nghttp2_stream_get_weight], 
-        [APR_ADDTO(MOD_CPPFLAGS, ["-DH2_NG2_STREAM_API"])], [])
+      AC_CHECK_FUNCS([nghttp2_stream_get_weight], [], [liberrors="yes"])
+      if test "x$liberrors" != "x"; then
+        AC_MSG_WARN([nghttp2 version >= 1.3.0 is required])
+      fi
 dnl # nghttp2 >= 1.5.0: changing stream priorities
       AC_CHECK_FUNCS([nghttp2_session_change_stream_priority], 
         [APR_ADDTO(MOD_CPPFLAGS, ["-DH2_NG2_CHANGE_PRIO"])], [])
@@ -180,6 +183,11 @@ APACHE_MODULE(http2, [HTTP/2 protocol handling in addition to HTTP protocol
 handling. Implemented by mod_http2. This module requires a libnghttp2 installation. 
 See --with-nghttp2 on how to manage non-standard locations. This module
 is usually linked shared and requires loading. ], $http2_objs, , most, [
+    APACHE_CHECK_OPENSSL
+    if test "$ac_cv_openssl" = "yes" ; then
+        APR_ADDTO(MOD_CPPFLAGS, ["-DH2_OPENSSL"])
+    fi
+
     APACHE_CHECK_NGHTTP2
     if test "$ac_cv_nghttp2" = "yes" ; then
         if test "x$enable_http2" = "xshared"; then
@@ -191,6 +199,12 @@ is usually linked shared and requires loading. ], $http2_objs, , most, [
         enable_http2=no
     fi
 ])
+
+# Ensure that other modules can pick up mod_http2.h
+# icing: hold back for now until it is more stable
+#APR_ADDTO(INCLUDES, [-I\$(top_srcdir)/$modpath_current])
+
+
 
 dnl #  end of module specific part
 APACHE_MODPATH_FINISH
