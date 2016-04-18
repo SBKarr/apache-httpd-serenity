@@ -62,6 +62,7 @@ PORT=8080
 	--disable-cache_socache \
 	--disable-include \
 	--disable-remoteip \
+	--enable-dbd \
 	--enable-authz-host \
 	--enable-authz-core \
 	--enable-ssl \

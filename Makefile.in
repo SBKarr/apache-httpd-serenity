@@ -15,7 +15,8 @@ PROGRAM_DEPENDENCIES = \
 sbin_PROGRAMS   = $(PROGRAM_NAME)
 TARGETS         = $(sbin_PROGRAMS) $(shared_build) $(other_targets)
 INSTALL_TARGETS = install-conf install-htdocs install-error install-icons \
-	install-other install-cgi install-include install-suexec install-build
+	install-other install-cgi install-include install-suexec install-build \
+	install-man
 
 DISTCLEAN_TARGETS  = include/ap_config_auto.h include/ap_config_layout.h \
 	include/apache_probes.h \
@@ -233,6 +234,7 @@ INSTALL_HEADERS = \
 	$(srcdir)/modules/proxy/mod_proxy.h \
         $(srcdir)/modules/session/mod_session.h \
 	$(srcdir)/modules/ssl/mod_ssl.h \
+	$(srcdir)/modules/ssl/mod_ssl_openssl.h \
 	$(srcdir)/os/$(OS_DIR)/*.h
 
 install-include:
@@ -244,18 +246,6 @@ install-include:
 
 install-man:
 	@echo Installing man pages and online manual
-	@test -d $(DESTDIR)$(mandir)      || $(MKINSTALLDIRS) $(DESTDIR)$(mandir)
-	@test -d $(DESTDIR)$(mandir)/man1 || $(MKINSTALLDIRS) $(DESTDIR)$(mandir)/man1
-	@test -d $(DESTDIR)$(mandir)/man8 || $(MKINSTALLDIRS) $(DESTDIR)$(mandir)/man8
-	@test -d $(DESTDIR)$(manualdir)   || $(MKINSTALLDIRS) $(DESTDIR)$(manualdir)
-	@cp -p $(top_srcdir)/docs/man/*.1 $(DESTDIR)$(mandir)/man1
-	@cp -p $(top_srcdir)/docs/man/*.8 $(DESTDIR)$(mandir)/man8
-	@if test "x$(RSYNC)" != "x" && test -x $(RSYNC) ; then \
-	  $(RSYNC) --exclude .svn -rlpt --numeric-ids $(top_srcdir)/docs/manual/ $(DESTDIR)$(manualdir)/; \
-	else \
-	  cd $(top_srcdir)/docs/manual && cp -rp * $(DESTDIR)$(manualdir); \
-	  cd $(DESTDIR)$(manualdir) && find . -name ".svn" -type d -print | xargs rm -rf 2>/dev/null || true; \
-	fi
 
 install-suexec:
 	@if test -f $(builddir)/support/suexec; then \
