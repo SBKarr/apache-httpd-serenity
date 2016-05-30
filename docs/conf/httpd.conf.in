@@ -19,7 +19,6 @@
 # will be interpreted as '/logs/access_log'.
 
 ServerRoot "@@ServerRoot@@"
-Listen @@Port@@
 
 # fake directive for apxs
 #LoadModule modile_name module_file.so
