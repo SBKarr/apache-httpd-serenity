@@ -1,10 +1,10 @@
 #!/bin/bash
 
-#if [ $2 = "dev" ]; then
+if [ $2 = "dev" ]; then
 PORT=8080
-#else
-#PORT=80
-#fi
+else
+PORT=80
+fi
 
 ./configure --prefix=$1 \
 	--with-mpm=event \
