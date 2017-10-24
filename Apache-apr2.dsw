@@ -446,24 +446,6 @@ Package=<5>
 
 Package=<4>
 {{{
-    Begin Project Dependency
-    Project_Dep_Name expat_static
-    End Project Dependency
-}}}
-
-###############################################################################
-
-Project: "apr_dbd_freetds"=".\srclib\apr\dbd\apr_dbd_freetds.dsp" - Package Owner=<4>
-
-Package=<5>
-{{{
-}}}
-
-Package=<4>
-{{{
-    Begin Project Dependency
-    Project_Dep_Name libapr
-    End Project Dependency
 }}}
 
 ###############################################################################
@@ -588,30 +570,6 @@ Package=<4>
 
 ###############################################################################
 
-Project: "expat"=".\srclib\expat\lib\expat.dsp" - Package Owner=<4>
-
-Package=<5>
-{{{
-}}}
-
-Package=<4>
-{{{
-}}}
-
-###############################################################################
-
-Project: "expat_static"=".\srclib\expat\lib\expat_static.dsp" - Package Owner=<4>
-
-Package=<5>
-{{{
-}}}
-
-Package=<4>
-{{{
-}}}
-
-###############################################################################
-
 Project: "fcgistarter"=.\support\fcgistarter.dsp - Package Owner=<4>
 
 Package=<5>
@@ -725,9 +683,6 @@ Package=<5>
 
 Package=<4>
 {{{
-    Begin Project Dependency
-    Project_Dep_Name expat
-    End Project Dependency
 }}}
 
 ###############################################################################
@@ -1226,6 +1181,24 @@ Package=<4>
 ###############################################################################
 
 Project: "mod_autoindex"=.\modules\generators\mod_autoindex.dsp - Package Owner=<4>
+
+Package=<5>
+{{{
+}}}
+
+Package=<4>
+{{{
+    Begin Project Dependency
+    Project_Dep_Name libapr
+    End Project Dependency
+    Begin Project Dependency
+    Project_Dep_Name libhttpd
+    End Project Dependency
+}}}
+
+###############################################################################
+
+Project: "mod_brotli"=.\modules\filters\mod_brotli.dsp - Package Owner=<4>
 
 Package=<5>
 {{{

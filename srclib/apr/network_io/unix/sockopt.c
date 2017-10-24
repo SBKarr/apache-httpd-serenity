@@ -161,18 +161,6 @@ apr_status_t apr_socket_opt_set(apr_socket_t *sock,
             apr_set_option(sock, APR_SO_REUSEADDR, on);
         }
         break;
-    case APR_SO_REUSEPORT:
-#ifdef SO_REUSEPORT
-        if (on != apr_is_option_set(sock, APR_SO_REUSEPORT)) {
-            if (setsockopt(sock->socketdes, SOL_SOCKET, SO_REUSEPORT, (void *)&one, sizeof(int)) == -1) {
-                return errno;
-            }
-            apr_set_option(sock, APR_SO_REUSEPORT, on);
-        }
-#else
-        return APR_ENOTIMPL;
-#endif
-        break;
     case APR_SO_SNDBUF:
 #ifdef SO_SNDBUF
         if (setsockopt(sock->socketdes, SOL_SOCKET, SO_SNDBUF, (void *)&on, sizeof(int)) == -1) {
@@ -342,6 +330,20 @@ apr_status_t apr_socket_opt_set(apr_socket_t *sock,
         return APR_ENOTIMPL;
 #endif
         break;
+    case APR_SO_FREEBIND:
+#if defined(IP_FREEBIND)
+        if (setsockopt(sock->socketdes, SOL_IP, IP_FREEBIND,
+                       (void *)&one, sizeof(int)) == -1) {
+            return errno;
+        }
+        apr_set_option(sock, APR_SO_FREEBIND, on);
+#elif 0 /* defined(IP_BINDANY) ... */
+        /* TODO: insert FreeBSD support here, note family specific
+         * options, IP_BINDANY vs IPV6_BINDANY */
+#else
+        return APR_ENOTIMPL;
+#endif
+        break;
     default:
         return APR_EINVAL;
     }
@@ -440,3 +442,24 @@ apr_status_t apr_socket_accept_filter(apr_socket_t *sock, char *nonconst_name,
     return APR_SUCCESS;
 }
 #endif
+
+APR_PERMS_SET_IMPLEMENT(socket)
+{
+#if APR_HAVE_SOCKADDR_UN
+    apr_status_t rv = APR_SUCCESS;
+    apr_socket_t *socket = (apr_socket_t *)thesocket;
+
+    if (socket->local_addr->family == APR_UNIX) {
+        if (!(perms & APR_FPROT_GSETID))
+            gid = -1;
+        if (fchown(socket->socketdes, uid, gid) < 0) {
+            rv = errno;
+        }
+    }
+    else
+        rv = APR_EINVAL;
+    return rv;
+#else
+    return APR_ENOTIMPL;
+#endif
+}

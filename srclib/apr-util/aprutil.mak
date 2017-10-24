@@ -27,6 +27,12 @@ NULL=
 NULL=nul
 !ENDIF 
 
+!IF "$(_HAVE_OSSL110)" == "1"
+SSLINC=/I ../openssl/include
+!ELSE 
+SSLINC=/I ../openssl/inc32
+!ENDIF 
+
 !IF  "$(CFG)" == "aprutil - Win32 Release"
 
 OUTDIR=.\LibR
@@ -41,12 +47,12 @@ ALL : "$(OUTDIR)\aprutil-1.lib"
 
 !ELSE 
 
-ALL : "xml - Win32 Release" "apriconv - Win32 Release" "$(OUTDIR)\aprutil-1.lib"
+ALL : "apriconv - Win32 Release" "$(OUTDIR)\aprutil-1.lib"
 
 !ENDIF 
 
 !IF "$(RECURSE)" == "1" 
-CLEAN :"apriconv - Win32 ReleaseCLEAN" "xml - Win32 ReleaseCLEAN" 
+CLEAN :"apriconv - Win32 ReleaseCLEAN" 
 !ELSE 
 CLEAN :
 !ENDIF 
@@ -67,7 +73,6 @@ CLEAN :
 	-@erase "$(INTDIR)\apr_crypto.obj"
 	-@erase "$(INTDIR)\apr_date.obj"
 	-@erase "$(INTDIR)\apr_dbd.obj"
-	-@erase "$(INTDIR)\apr_dbd_freetds.obj"
 	-@erase "$(INTDIR)\apr_dbd_mysql.obj"
 	-@erase "$(INTDIR)\apr_dbd_odbc.obj"
 	-@erase "$(INTDIR)\apr_dbd_oracle.obj"
@@ -89,9 +94,11 @@ CLEAN :
 	-@erase "$(INTDIR)\apr_memcache.obj"
 	-@erase "$(INTDIR)\apr_passwd.obj"
 	-@erase "$(INTDIR)\apr_queue.obj"
+	-@erase "$(INTDIR)\apr_redis.obj"
 	-@erase "$(INTDIR)\apr_reslist.obj"
 	-@erase "$(INTDIR)\apr_rmm.obj"
 	-@erase "$(INTDIR)\apr_sha1.obj"
+	-@erase "$(INTDIR)\apr_siphash.obj"
 	-@erase "$(INTDIR)\apr_strmatch.obj"
 	-@erase "$(INTDIR)\apr_thread_pool.obj"
 	-@erase "$(INTDIR)\apr_uri.obj"
@@ -114,7 +121,7 @@ CLEAN :
     if not exist "$(OUTDIR)/$(NULL)" mkdir "$(OUTDIR)"
 
 CPP=cl.exe
-CPP_PROJ=/nologo /MD /W3 /Zi /O2 /Oy- /I "./include" /I "../apr/include" /I "./include/private" /I "../apr-iconv/include" /I "./dbm/sdbm" /I "./xml/expat/lib" /D "NDEBUG" /D "APR_DECLARE_STATIC" /D "APU_DECLARE_STATIC" /D "API_DECLARE_STATIC" /D "APU_USE_SDBM" /D "HAVE_SQL_H" /D "XML_STATIC" /D "WIN32" /D "_WINDOWS" /Fo"$(INTDIR)\\" /Fd"$(OUTDIR)\aprutil-1" /FD /c 
+CPP_PROJ=/nologo /MD /W3 /Zi /O2 /Oy- /I "./include" /I "../apr/include" /I "./include/private" /I "../apr-iconv/include" /I "./dbm/sdbm" /I "./xml/expat/lib" $(SSLINC) /D "NDEBUG" /D "APR_DECLARE_STATIC" /D "APU_DECLARE_STATIC" /D "API_DECLARE_STATIC" /D "APU_USE_SDBM" /D "HAVE_SQL_H" /D "XML_STATIC" /D "WIN32" /D "_WINDOWS" /Fo"$(INTDIR)\\" /Fd"$(OUTDIR)\aprutil-1" /FD /c 
 
 .c{$(INTDIR)}.obj::
    $(CPP) @<<
@@ -172,11 +179,11 @@ LIB32_OBJS= \
 	"$(INTDIR)\apr_md5.obj" \
 	"$(INTDIR)\apr_passwd.obj" \
 	"$(INTDIR)\apr_sha1.obj" \
+	"$(INTDIR)\apr_siphash.obj" \
 	"$(INTDIR)\crypt_blowfish.obj" \
 	"$(INTDIR)\getuuid.obj" \
 	"$(INTDIR)\uuid.obj" \
 	"$(INTDIR)\apr_dbd.obj" \
-	"$(INTDIR)\apr_dbd_freetds.obj" \
 	"$(INTDIR)\apr_dbd_mysql.obj" \
 	"$(INTDIR)\apr_dbd_odbc.obj" \
 	"$(INTDIR)\apr_dbd_oracle.obj" \
@@ -198,6 +205,7 @@ LIB32_OBJS= \
 	"$(INTDIR)\apr_date.obj" \
 	"$(INTDIR)\apu_dso.obj" \
 	"$(INTDIR)\apr_queue.obj" \
+	"$(INTDIR)\apr_redis.obj" \
 	"$(INTDIR)\apr_reslist.obj" \
 	"$(INTDIR)\apr_rmm.obj" \
 	"$(INTDIR)\apr_thread_pool.obj" \
@@ -210,8 +218,7 @@ LIB32_OBJS= \
 	"$(INTDIR)\apr_uri.obj" \
 	"$(INTDIR)\xlate.obj" \
 	"$(INTDIR)\apr_xml.obj" \
-	"..\apr-iconv\LibR\apriconv-1.lib" \
-	".\xml\expat\lib\LibR\xml.lib"
+	"..\apr-iconv\LibR\apriconv-1.lib"
 
 "$(OUTDIR)\aprutil-1.lib" : "$(OUTDIR)" $(DEF_FILE) $(LIB32_OBJS)
     $(LIB32) @<<
@@ -232,12 +239,12 @@ ALL : ".\include\private\apu_select_dbm.h" ".\include\private\apu_config.h" ".\i
 
 !ELSE 
 
-ALL : "xml - Win32 Debug" "apriconv - Win32 Debug" ".\include\private\apu_select_dbm.h" ".\include\private\apu_config.h" ".\include\apu_want.h" ".\include\apu.h" ".\include\apr_ldap.h" "$(OUTDIR)\aprutil-1.lib"
+ALL : "apriconv - Win32 Debug" ".\include\private\apu_select_dbm.h" ".\include\private\apu_config.h" ".\include\apu_want.h" ".\include\apu.h" ".\include\apr_ldap.h" "$(OUTDIR)\aprutil-1.lib"
 
 !ENDIF 
 
 !IF "$(RECURSE)" == "1" 
-CLEAN :"apriconv - Win32 DebugCLEAN" "xml - Win32 DebugCLEAN" 
+CLEAN :"apriconv - Win32 DebugCLEAN" 
 !ELSE 
 CLEAN :
 !ENDIF 
@@ -258,7 +265,6 @@ CLEAN :
 	-@erase "$(INTDIR)\apr_crypto.obj"
 	-@erase "$(INTDIR)\apr_date.obj"
 	-@erase "$(INTDIR)\apr_dbd.obj"
-	-@erase "$(INTDIR)\apr_dbd_freetds.obj"
 	-@erase "$(INTDIR)\apr_dbd_mysql.obj"
 	-@erase "$(INTDIR)\apr_dbd_odbc.obj"
 	-@erase "$(INTDIR)\apr_dbd_oracle.obj"
@@ -280,9 +286,11 @@ CLEAN :
 	-@erase "$(INTDIR)\apr_memcache.obj"
 	-@erase "$(INTDIR)\apr_passwd.obj"
 	-@erase "$(INTDIR)\apr_queue.obj"
+	-@erase "$(INTDIR)\apr_redis.obj"
 	-@erase "$(INTDIR)\apr_reslist.obj"
 	-@erase "$(INTDIR)\apr_rmm.obj"
 	-@erase "$(INTDIR)\apr_sha1.obj"
+	-@erase "$(INTDIR)\apr_siphash.obj"
 	-@erase "$(INTDIR)\apr_strmatch.obj"
 	-@erase "$(INTDIR)\apr_thread_pool.obj"
 	-@erase "$(INTDIR)\apr_uri.obj"
@@ -310,7 +318,7 @@ CLEAN :
     if not exist "$(OUTDIR)/$(NULL)" mkdir "$(OUTDIR)"
 
 CPP=cl.exe
-CPP_PROJ=/nologo /MDd /W3 /Zi /Od /I "./include" /I "../apr/include" /I "./include/private" /I "../apr-iconv/include" /I "./dbm/sdbm" /I "./xml/expat/lib" /D "_DEBUG" /D "APR_DECLARE_STATIC" /D "APU_DECLARE_STATIC" /D "API_DECLARE_STATIC" /D "APU_USE_SDBM" /D "HAVE_SQL_H" /D "XML_STATIC" /D "WIN32" /D "_WINDOWS" /Fo"$(INTDIR)\\" /Fd"$(OUTDIR)\aprutil-1" /FD /EHsc /c 
+CPP_PROJ=/nologo /MDd /W3 /Zi /Od /I "./include" /I "../apr/include" /I "./include/private" /I "../apr-iconv/include" /I "./dbm/sdbm" /I "./xml/expat/lib"  $(SSLINC)/D "_DEBUG" /D "APR_DECLARE_STATIC" /D "APU_DECLARE_STATIC" /D "API_DECLARE_STATIC" /D "APU_USE_SDBM" /D "HAVE_SQL_H" /D "XML_STATIC" /D "WIN32" /D "_WINDOWS" /Fo"$(INTDIR)\\" /Fd"$(OUTDIR)\aprutil-1" /FD /EHsc /c 
 
 .c{$(INTDIR)}.obj::
    $(CPP) @<<
@@ -368,11 +376,11 @@ LIB32_OBJS= \
 	"$(INTDIR)\apr_md5.obj" \
 	"$(INTDIR)\apr_passwd.obj" \
 	"$(INTDIR)\apr_sha1.obj" \
+	"$(INTDIR)\apr_siphash.obj" \
 	"$(INTDIR)\crypt_blowfish.obj" \
 	"$(INTDIR)\getuuid.obj" \
 	"$(INTDIR)\uuid.obj" \
 	"$(INTDIR)\apr_dbd.obj" \
-	"$(INTDIR)\apr_dbd_freetds.obj" \
 	"$(INTDIR)\apr_dbd_mysql.obj" \
 	"$(INTDIR)\apr_dbd_odbc.obj" \
 	"$(INTDIR)\apr_dbd_oracle.obj" \
@@ -394,6 +402,7 @@ LIB32_OBJS= \
 	"$(INTDIR)\apr_date.obj" \
 	"$(INTDIR)\apu_dso.obj" \
 	"$(INTDIR)\apr_queue.obj" \
+	"$(INTDIR)\apr_redis.obj" \
 	"$(INTDIR)\apr_reslist.obj" \
 	"$(INTDIR)\apr_rmm.obj" \
 	"$(INTDIR)\apr_thread_pool.obj" \
@@ -406,8 +415,7 @@ LIB32_OBJS= \
 	"$(INTDIR)\apr_uri.obj" \
 	"$(INTDIR)\xlate.obj" \
 	"$(INTDIR)\apr_xml.obj" \
-	"..\apr-iconv\LibD\apriconv-1.lib" \
-	".\xml\expat\lib\LibD\xml.lib"
+	"..\apr-iconv\LibD\apriconv-1.lib"
 
 "$(OUTDIR)\aprutil-1.lib" : "$(OUTDIR)" $(DEF_FILE) $(LIB32_OBJS)
     $(LIB32) @<<
@@ -428,12 +436,12 @@ ALL : ".\include\private\apu_select_dbm.h" ".\include\private\apu_config.h" ".\i
 
 !ELSE 
 
-ALL : "xml - x64 Release" "apriconv - x64 Release" ".\include\private\apu_select_dbm.h" ".\include\private\apu_config.h" ".\include\apu_want.h" ".\include\apu.h" ".\include\apr_ldap.h" "$(OUTDIR)\aprutil-1.lib"
+ALL : "apriconv - x64 Release" ".\include\private\apu_select_dbm.h" ".\include\private\apu_config.h" ".\include\apu_want.h" ".\include\apu.h" ".\include\apr_ldap.h" "$(OUTDIR)\aprutil-1.lib"
 
 !ENDIF 
 
 !IF "$(RECURSE)" == "1" 
-CLEAN :"apriconv - x64 ReleaseCLEAN" "xml - x64 ReleaseCLEAN" 
+CLEAN :"apriconv - x64 ReleaseCLEAN" 
 !ELSE 
 CLEAN :
 !ENDIF 
@@ -454,7 +462,6 @@ CLEAN :
 	-@erase "$(INTDIR)\apr_crypto.obj"
 	-@erase "$(INTDIR)\apr_date.obj"
 	-@erase "$(INTDIR)\apr_dbd.obj"
-	-@erase "$(INTDIR)\apr_dbd_freetds.obj"
 	-@erase "$(INTDIR)\apr_dbd_mysql.obj"
 	-@erase "$(INTDIR)\apr_dbd_odbc.obj"
 	-@erase "$(INTDIR)\apr_dbd_oracle.obj"
@@ -476,9 +483,11 @@ CLEAN :
 	-@erase "$(INTDIR)\apr_memcache.obj"
 	-@erase "$(INTDIR)\apr_passwd.obj"
 	-@erase "$(INTDIR)\apr_queue.obj"
+	-@erase "$(INTDIR)\apr_redis.obj"
 	-@erase "$(INTDIR)\apr_reslist.obj"
 	-@erase "$(INTDIR)\apr_rmm.obj"
 	-@erase "$(INTDIR)\apr_sha1.obj"
+	-@erase "$(INTDIR)\apr_siphash.obj"
 	-@erase "$(INTDIR)\apr_strmatch.obj"
 	-@erase "$(INTDIR)\apr_thread_pool.obj"
 	-@erase "$(INTDIR)\apr_uri.obj"
@@ -506,7 +515,7 @@ CLEAN :
     if not exist "$(OUTDIR)/$(NULL)" mkdir "$(OUTDIR)"
 
 CPP=cl.exe
-CPP_PROJ=/nologo /MD /W3 /Zi /O2 /Oy- /I "./include" /I "../apr/include" /I "./include/private" /I "../apr-iconv/include" /I "./dbm/sdbm" /I "./xml/expat/lib" /D "NDEBUG" /D "APR_DECLARE_STATIC" /D "APU_DECLARE_STATIC" /D "API_DECLARE_STATIC" /D "APU_USE_SDBM" /D "HAVE_SQL_H" /D "XML_STATIC" /D "WIN32" /D "_WINDOWS" /Fo"$(INTDIR)\\" /Fd"$(OUTDIR)\aprutil-1" /FD /c 
+CPP_PROJ=/nologo /MD /W3 /Zi /O2 /Oy- /I "./include" /I "../apr/include" /I "./include/private" /I "../apr-iconv/include" /I "./dbm/sdbm" /I "./xml/expat/lib" $(SSLINC) /D "NDEBUG" /D "APR_DECLARE_STATIC" /D "APU_DECLARE_STATIC" /D "API_DECLARE_STATIC" /D "APU_USE_SDBM" /D "HAVE_SQL_H" /D "XML_STATIC" /D "WIN32" /D "_WINDOWS" /Fo"$(INTDIR)\\" /Fd"$(OUTDIR)\aprutil-1" /FD /c 
 
 .c{$(INTDIR)}.obj::
    $(CPP) @<<
@@ -564,11 +573,11 @@ LIB32_OBJS= \
 	"$(INTDIR)\apr_md5.obj" \
 	"$(INTDIR)\apr_passwd.obj" \
 	"$(INTDIR)\apr_sha1.obj" \
+	"$(INTDIR)\apr_siphash.obj" \
 	"$(INTDIR)\crypt_blowfish.obj" \
 	"$(INTDIR)\getuuid.obj" \
 	"$(INTDIR)\uuid.obj" \
 	"$(INTDIR)\apr_dbd.obj" \
-	"$(INTDIR)\apr_dbd_freetds.obj" \
 	"$(INTDIR)\apr_dbd_mysql.obj" \
 	"$(INTDIR)\apr_dbd_odbc.obj" \
 	"$(INTDIR)\apr_dbd_oracle.obj" \
@@ -590,6 +599,7 @@ LIB32_OBJS= \
 	"$(INTDIR)\apr_date.obj" \
 	"$(INTDIR)\apu_dso.obj" \
 	"$(INTDIR)\apr_queue.obj" \
+	"$(INTDIR)\apr_redis.obj" \
 	"$(INTDIR)\apr_reslist.obj" \
 	"$(INTDIR)\apr_rmm.obj" \
 	"$(INTDIR)\apr_thread_pool.obj" \
@@ -602,8 +612,7 @@ LIB32_OBJS= \
 	"$(INTDIR)\apr_uri.obj" \
 	"$(INTDIR)\xlate.obj" \
 	"$(INTDIR)\apr_xml.obj" \
-	"..\apr-iconv\x64\LibR\apriconv-1.lib" \
-	".\xml\expat\lib\x64\LibR\xml.lib"
+	"..\apr-iconv\x64\LibR\apriconv-1.lib"
 
 "$(OUTDIR)\aprutil-1.lib" : "$(OUTDIR)" $(DEF_FILE) $(LIB32_OBJS)
     $(LIB32) @<<
@@ -624,12 +633,12 @@ ALL : ".\include\private\apu_select_dbm.h" ".\include\private\apu_config.h" ".\i
 
 !ELSE 
 
-ALL : "xml - x64 Debug" "apriconv - x64 Debug" ".\include\private\apu_select_dbm.h" ".\include\private\apu_config.h" ".\include\apu_want.h" ".\include\apu.h" ".\include\apr_ldap.h" "$(OUTDIR)\aprutil-1.lib"
+ALL : "apriconv - x64 Debug" ".\include\private\apu_select_dbm.h" ".\include\private\apu_config.h" ".\include\apu_want.h" ".\include\apu.h" ".\include\apr_ldap.h" "$(OUTDIR)\aprutil-1.lib"
 
 !ENDIF 
 
 !IF "$(RECURSE)" == "1" 
-CLEAN :"apriconv - x64 DebugCLEAN" "xml - x64 DebugCLEAN" 
+CLEAN :"apriconv - x64 DebugCLEAN" 
 !ELSE 
 CLEAN :
 !ENDIF 
@@ -650,7 +659,6 @@ CLEAN :
 	-@erase "$(INTDIR)\apr_crypto.obj"
 	-@erase "$(INTDIR)\apr_date.obj"
 	-@erase "$(INTDIR)\apr_dbd.obj"
-	-@erase "$(INTDIR)\apr_dbd_freetds.obj"
 	-@erase "$(INTDIR)\apr_dbd_mysql.obj"
 	-@erase "$(INTDIR)\apr_dbd_odbc.obj"
 	-@erase "$(INTDIR)\apr_dbd_oracle.obj"
@@ -672,9 +680,11 @@ CLEAN :
 	-@erase "$(INTDIR)\apr_memcache.obj"
 	-@erase "$(INTDIR)\apr_passwd.obj"
 	-@erase "$(INTDIR)\apr_queue.obj"
+	-@erase "$(INTDIR)\apr_redis.obj"
 	-@erase "$(INTDIR)\apr_reslist.obj"
 	-@erase "$(INTDIR)\apr_rmm.obj"
 	-@erase "$(INTDIR)\apr_sha1.obj"
+	-@erase "$(INTDIR)\apr_siphash.obj"
 	-@erase "$(INTDIR)\apr_strmatch.obj"
 	-@erase "$(INTDIR)\apr_thread_pool.obj"
 	-@erase "$(INTDIR)\apr_uri.obj"
@@ -702,7 +712,7 @@ CLEAN :
     if not exist "$(OUTDIR)/$(NULL)" mkdir "$(OUTDIR)"
 
 CPP=cl.exe
-CPP_PROJ=/nologo /MDd /W3 /Zi /Od /I "./include" /I "../apr/include" /I "./include/private" /I "../apr-iconv/include" /I "./dbm/sdbm" /I "./xml/expat/lib" /D "_DEBUG" /D "APR_DECLARE_STATIC" /D "APU_DECLARE_STATIC" /D "API_DECLARE_STATIC" /D "APU_USE_SDBM" /D "HAVE_SQL_H" /D "XML_STATIC" /D "WIN32" /D "_WINDOWS" /Fo"$(INTDIR)\\" /Fd"$(OUTDIR)\aprutil-1" /FD /EHsc /c 
+CPP_PROJ=/nologo /MDd /W3 /Zi /Od /I "./include" /I "../apr/include" /I "./include/private" /I "../apr-iconv/include" /I "./dbm/sdbm" /I "./xml/expat/lib" $(SSLINC) /D "_DEBUG" /D "APR_DECLARE_STATIC" /D "APU_DECLARE_STATIC" /D "API_DECLARE_STATIC" /D "APU_USE_SDBM" /D "HAVE_SQL_H" /D "XML_STATIC" /D "WIN32" /D "_WINDOWS" /Fo"$(INTDIR)\\" /Fd"$(OUTDIR)\aprutil-1" /FD /EHsc /c 
 
 .c{$(INTDIR)}.obj::
    $(CPP) @<<
@@ -760,11 +770,11 @@ LIB32_OBJS= \
 	"$(INTDIR)\apr_md5.obj" \
 	"$(INTDIR)\apr_passwd.obj" \
 	"$(INTDIR)\apr_sha1.obj" \
+	"$(INTDIR)\apr_siphash.obj" \
 	"$(INTDIR)\crypt_blowfish.obj" \
 	"$(INTDIR)\getuuid.obj" \
 	"$(INTDIR)\uuid.obj" \
 	"$(INTDIR)\apr_dbd.obj" \
-	"$(INTDIR)\apr_dbd_freetds.obj" \
 	"$(INTDIR)\apr_dbd_mysql.obj" \
 	"$(INTDIR)\apr_dbd_odbc.obj" \
 	"$(INTDIR)\apr_dbd_oracle.obj" \
@@ -786,6 +796,7 @@ LIB32_OBJS= \
 	"$(INTDIR)\apr_date.obj" \
 	"$(INTDIR)\apu_dso.obj" \
 	"$(INTDIR)\apr_queue.obj" \
+	"$(INTDIR)\apr_redis.obj" \
 	"$(INTDIR)\apr_reslist.obj" \
 	"$(INTDIR)\apr_rmm.obj" \
 	"$(INTDIR)\apr_thread_pool.obj" \
@@ -798,8 +809,7 @@ LIB32_OBJS= \
 	"$(INTDIR)\apr_uri.obj" \
 	"$(INTDIR)\xlate.obj" \
 	"$(INTDIR)\apr_xml.obj" \
-	"..\apr-iconv\x64\LibD\apriconv-1.lib" \
-	".\xml\expat\lib\x64\LibD\xml.lib"
+	"..\apr-iconv\x64\LibD\apriconv-1.lib"
 
 "$(OUTDIR)\aprutil-1.lib" : "$(OUTDIR)" $(DEF_FILE) $(LIB32_OBJS)
     $(LIB32) @<<
@@ -927,6 +937,12 @@ SOURCE=.\crypto\apr_sha1.c
 	$(CPP) $(CPP_PROJ) $(SOURCE)
 
 
+SOURCE=.\crypto\apr_siphash.c
+
+"$(INTDIR)\apr_siphash.obj" : $(SOURCE) "$(INTDIR)"
+	$(CPP) $(CPP_PROJ) $(SOURCE)
+
+
 SOURCE=.\crypto\crypt_blowfish.c
 
 "$(INTDIR)\crypt_blowfish.obj" : $(SOURCE) "$(INTDIR)"
@@ -948,12 +964,6 @@ SOURCE=.\crypto\uuid.c
 SOURCE=.\dbd\apr_dbd.c
 
 "$(INTDIR)\apr_dbd.obj" : $(SOURCE) "$(INTDIR)" ".\include\private\apu_config.h" ".\include\apu.h"
-	$(CPP) $(CPP_PROJ) $(SOURCE)
-
-
-SOURCE=.\dbd\apr_dbd_freetds.c
-
-"$(INTDIR)\apr_dbd_freetds.obj" : $(SOURCE) "$(INTDIR)" ".\include\apu.h" ".\include\private\apu_config.h"
 	$(CPP) $(CPP_PROJ) $(SOURCE)
 
 
@@ -1104,6 +1114,12 @@ SOURCE=.\misc\apu_dso.c
 SOURCE=.\misc\apu_version.c
 
 "$(INTDIR)\apu_version.obj" : $(SOURCE) "$(INTDIR)" ".\include\apu.h"
+	$(CPP) $(CPP_PROJ) $(SOURCE)
+
+
+SOURCE=.\redis\apr_redis.c
+
+"$(INTDIR)\apr_redis.obj" : $(SOURCE) "$(INTDIR)" ".\include\apr_redis.h"
 	$(CPP) $(CPP_PROJ) $(SOURCE)
 
 
@@ -1442,56 +1458,6 @@ InputPath=.\include\apu_want.hw
    cd ".\..\apr-iconv"
    $(MAKE) /$(MAKEFLAGS) /F ".\apriconv.mak" CFG="apriconv - x64 Debug" RECURSE=1 CLEAN 
    cd "..\apr-util"
-
-!ENDIF 
-
-!IF  "$(CFG)" == "aprutil - Win32 Release"
-
-"xml - Win32 Release" : 
-   cd ".\xml\expat\lib"
-   $(MAKE) /$(MAKEFLAGS) /F ".\xml.mak" CFG="xml - Win32 Release" 
-   cd "..\..\.."
-
-"xml - Win32 ReleaseCLEAN" : 
-   cd ".\xml\expat\lib"
-   $(MAKE) /$(MAKEFLAGS) /F ".\xml.mak" CFG="xml - Win32 Release" RECURSE=1 CLEAN 
-   cd "..\..\.."
-
-!ELSEIF  "$(CFG)" == "aprutil - Win32 Debug"
-
-"xml - Win32 Debug" : 
-   cd ".\xml\expat\lib"
-   $(MAKE) /$(MAKEFLAGS) /F ".\xml.mak" CFG="xml - Win32 Debug" 
-   cd "..\..\.."
-
-"xml - Win32 DebugCLEAN" : 
-   cd ".\xml\expat\lib"
-   $(MAKE) /$(MAKEFLAGS) /F ".\xml.mak" CFG="xml - Win32 Debug" RECURSE=1 CLEAN 
-   cd "..\..\.."
-
-!ELSEIF  "$(CFG)" == "aprutil - x64 Release"
-
-"xml - x64 Release" : 
-   cd ".\xml\expat\lib"
-   $(MAKE) /$(MAKEFLAGS) /F ".\xml.mak" CFG="xml - x64 Release" 
-   cd "..\..\.."
-
-"xml - x64 ReleaseCLEAN" : 
-   cd ".\xml\expat\lib"
-   $(MAKE) /$(MAKEFLAGS) /F ".\xml.mak" CFG="xml - x64 Release" RECURSE=1 CLEAN 
-   cd "..\..\.."
-
-!ELSEIF  "$(CFG)" == "aprutil - x64 Debug"
-
-"xml - x64 Debug" : 
-   cd ".\xml\expat\lib"
-   $(MAKE) /$(MAKEFLAGS) /F ".\xml.mak" CFG="xml - x64 Debug" 
-   cd "..\..\.."
-
-"xml - x64 DebugCLEAN" : 
-   cd ".\xml\expat\lib"
-   $(MAKE) /$(MAKEFLAGS) /F ".\xml.mak" CFG="xml - x64 Debug" RECURSE=1 CLEAN 
-   cd "..\..\.."
 
 !ENDIF 
 
