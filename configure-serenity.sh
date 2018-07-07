@@ -56,6 +56,7 @@
 	--disable-cache_socache \
 	--disable-include \
 	--disable-remoteip \
+	--disable-md \
 	--enable-dbd \
 	--enable-authz-host \
 	--enable-authz-core \
