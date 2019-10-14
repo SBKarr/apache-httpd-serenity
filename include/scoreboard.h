@@ -148,7 +148,9 @@ struct process_score {
     apr_uint32_t lingering_close;   /* async connections in lingering close */
     apr_uint32_t keep_alive;        /* async connections in keep alive */
     apr_uint32_t suspended;         /* connections suspended by some module */
-    int bucket;             /* Listener bucket used by this child */
+    int bucket;  /* Listener bucket used by this child; this field is DEPRECATED
+                  * and no longer updated by the MPMs (i.e. always zero).
+                  */
 };
 
 /* Scoreboard is now in 'local' memory, since it isn't updated once created,
@@ -174,6 +176,7 @@ apr_status_t ap_cleanup_scoreboard(void *d);
  */
 AP_DECLARE(int) ap_exists_scoreboard_image(void);
 AP_DECLARE(void) ap_increment_counts(ap_sb_handle_t *sbh, request_rec *r);
+AP_DECLARE(void) ap_set_conn_count(ap_sb_handle_t *sb, request_rec *r, unsigned short conn_count);
 
 AP_DECLARE(apr_status_t) ap_reopen_scoreboard(apr_pool_t *p, apr_shm_t **shm, int detached);
 AP_DECLARE(void) ap_init_scoreboard(void *shared_score);

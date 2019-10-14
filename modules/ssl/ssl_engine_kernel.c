@@ -1125,7 +1125,7 @@ static int ssl_hook_Access_modern(request_rec *r, SSLSrvConfigRec *sc, SSLDirCon
                                         : sc->server->auth.verify_depth;
                 if (sslconn->verify_depth < n) {
                     change_vmode = TRUE;
-                    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO()
+                    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(10128)
                                   "Reduced client verification depth will "
                                   "force renegotiation");
                 }
@@ -1144,7 +1144,8 @@ static int ssl_hook_Access_modern(request_rec *r, SSLSrvConfigRec *sc, SSLDirCon
                 return HTTP_FORBIDDEN;
             }
 
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO() "verify client post handshake");
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(10129)
+                          "verify client post handshake");
 
             SSL_set_verify(ssl, vmode_needed, ssl_callback_SSLVerify);
 
@@ -1154,6 +1155,7 @@ static int ssl_hook_Access_modern(request_rec *r, SSLSrvConfigRec *sc, SSLDirCon
                 ssl_log_ssl_error(SSLLOG_MARK, APLOG_ERR, r->server);
                 apr_table_setn(r->notes, "error-notes",
                                "Reason: Cannot perform Post-Handshake Authentication.<br />");
+                SSL_set_verify(ssl, vmode_inplace, NULL);
                 return HTTP_FORBIDDEN;
             }
             
@@ -1175,6 +1177,7 @@ static int ssl_hook_Access_modern(request_rec *r, SSLSrvConfigRec *sc, SSLDirCon
              * Finally check for acceptable renegotiation results
              */
             if (OK != (rc = ssl_check_post_client_verify(r, sc, dc, sslconn, ssl))) {
+                SSL_set_verify(ssl, vmode_inplace, NULL);
                 return rc;
             }
         }
@@ -1342,8 +1345,7 @@ int ssl_hook_Access(request_rec *r)
  */
 int ssl_hook_UserCheck(request_rec *r)
 {
-    SSLConnRec *sslconn = myConnConfig(r->connection);
-    SSLSrvConfigRec *sc = mySrvConfig(r->server);
+    SSLConnRec *sslconn;
     SSLDirConfigRec *dc = myDirConfig(r);
     char *clientdn;
     const char *auth_line, *username, *password;
@@ -1392,15 +1394,15 @@ int ssl_hook_UserCheck(request_rec *r)
 
     /*
      * We decline operation in various situations...
+     * - TLS not enabled
+     * - client did not present a certificate
      * - SSLOptions +FakeBasicAuth not configured
      * - r->user already authenticated
-     * - ssl not enabled
-     * - client did not present a certificate
      */
-    if (!((sc->enabled == SSL_ENABLED_TRUE || sc->enabled == SSL_ENABLED_OPTIONAL)
-          && sslconn && sslconn->ssl && sslconn->client_cert) ||
-        !(dc->nOptions & SSL_OPT_FAKEBASICAUTH) || r->user)
-    {
+    if (!modssl_request_is_tls(r, &sslconn)
+        || !sslconn->client_cert
+        || !(dc->nOptions & SSL_OPT_FAKEBASICAUTH)
+        || r->user) {
         return DECLINED;
     }
 
@@ -1500,8 +1502,6 @@ static const char *const ssl_hook_Fixup_vars[] = {
 
 int ssl_hook_Fixup(request_rec *r)
 {
-    SSLConnRec *sslconn = myConnConfig(r->connection);
-    SSLSrvConfigRec *sc = mySrvConfig(r->server);
     SSLDirConfigRec *dc = myDirConfig(r);
     apr_table_t *env = r->subprocess_env;
     char *var, *val = "";
@@ -1509,19 +1509,14 @@ int ssl_hook_Fixup(request_rec *r)
     const char *servername;
 #endif
     STACK_OF(X509) *peer_certs;
+    SSLConnRec *sslconn;
     SSL *ssl;
     int i;
 
-    if (!(sslconn && sslconn->ssl) && r->connection->master) {
-        sslconn = myConnConfig(r->connection->master);
-    }
-
-    /*
-     * Check to see if SSL is on
-     */
-    if (!(((sc->enabled == SSL_ENABLED_TRUE) || (sc->enabled == SSL_ENABLED_OPTIONAL)) && sslconn && (ssl = sslconn->ssl))) {
+    if (!modssl_request_is_tls(r, &sslconn)) {
         return DECLINED;
     }
+    ssl = sslconn->ssl;
 
     /*
      * Annotate the SSI/CGI environment with standard SSL information
@@ -1595,10 +1590,7 @@ static authz_status ssl_authz_require_ssl_check(request_rec *r,
                                                 const char *require_line,
                                                 const void *parsed)
 {
-    SSLConnRec *sslconn = myConnConfig(r->connection);
-    SSL *ssl = sslconn ? sslconn->ssl : NULL;
-
-    if (ssl)
+    if (modssl_request_is_tls(r, NULL))
         return AUTHZ_GRANTED;
     else
         return AUTHZ_DENIED;
@@ -2301,6 +2293,37 @@ void ssl_callback_Info(const SSL *ssl, int where, int rc)
 }
 
 #ifdef HAVE_TLSEXT
+
+static apr_status_t set_challenge_creds(conn_rec *c, const char *servername,
+                                        SSL *ssl, X509 *cert, EVP_PKEY *key)
+{
+    SSLConnRec *sslcon = myConnConfig(c);
+    
+    sslcon->service_unavailable = 1;
+    if ((SSL_use_certificate(ssl, cert) < 1)) {
+        ap_log_cerror(APLOG_MARK, APLOG_WARNING, 0, c, APLOGNO(10086)
+                      "Failed to configure challenge certificate %s",
+                      servername);
+        return APR_EGENERAL;
+    }
+    
+    if (!SSL_use_PrivateKey(ssl, key)) {
+        ap_log_cerror(APLOG_MARK, APLOG_WARNING, 0, c, APLOGNO(10087)
+                      "error '%s' using Challenge key: %s",
+                      ERR_error_string(ERR_peek_last_error(), NULL), 
+                      servername);
+        return APR_EGENERAL;
+    }
+    
+    if (SSL_check_private_key(ssl) < 1) {
+        ap_log_cerror(APLOG_MARK, APLOG_WARNING, 0, c, APLOGNO(10088)
+                      "Challenge certificate and private key %s "
+                      "do not match", servername);
+        return APR_EGENERAL;
+    }
+    return APR_SUCCESS;
+}
+  
 /*
  * This function sets the virtual host from an extended
  * client hello with a server name indication extension ("SNI", cf. RFC 6066).
@@ -2330,30 +2353,12 @@ static apr_status_t init_vhost(conn_rec *c, SSL *ssl)
                 return APR_SUCCESS;
             }
             else if (ssl_is_challenge(c, servername, &cert, &key)) {
-            
-                sslcon->service_unavailable = 1;
-                if ((SSL_use_certificate(ssl, cert) < 1)) {
-                    ap_log_cerror(APLOG_MARK, APLOG_WARNING, 0, c, APLOGNO(10086)
-                                  "Failed to configure challenge certificate %s",
-                                  servername);
+                /* With ACMEv1 we can have challenge connections to a unknown domains
+                 * that need to be answered with a special certificate and will
+                 * otherwise not answer any requests. */
+                if (set_challenge_creds(c, servername, ssl, cert, key) != APR_SUCCESS) {
                     return APR_EGENERAL;
                 }
-                
-                if (!SSL_use_PrivateKey(ssl, key)) {
-                    ap_log_cerror(APLOG_MARK, APLOG_WARNING, 0, c, APLOGNO(10087)
-                                  "error '%s' using Challenge key: %s",
-                                  ERR_error_string(ERR_peek_last_error(), NULL), 
-                                  servername);
-                    return APR_EGENERAL;
-                }
-                
-                if (SSL_check_private_key(ssl) < 1) {
-                    ap_log_cerror(APLOG_MARK, APLOG_WARNING, 0, c, APLOGNO(10088)
-                                  "Challenge certificate and private key %s "
-                                  "do not match", servername);
-                    return APR_EGENERAL;
-                }
-                
             }
             else {
                 ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c, APLOGNO(02044)
@@ -2645,6 +2650,23 @@ int ssl_callback_alpn_select(SSL *ssl,
                           APLOGNO(02908) "protocol switch to '%s' failed",
                           proposed);
             return SSL_TLSEXT_ERR_ALERT_FATAL;
+        }
+        
+        /* protocol was switched, this could be a challenge protocol such as "acme-tls/1".
+         * For that to work, we need to allow overrides to our ssl certificate. 
+         * However, exclude challenge checks on our best known traffic protocol.
+         * (http/1.1 is the default, we never switch to it anyway.)
+         */
+        if (strcmp("h2", proposed)) {
+            const char *servername = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+            X509 *cert;
+            EVP_PKEY *key;
+            
+            if (ssl_is_challenge(c, servername, &cert, &key)) {
+                if (set_challenge_creds(c, servername, ssl, cert, key) != APR_SUCCESS) {
+                    return SSL_TLSEXT_ERR_ALERT_FATAL;
+                }
+            }
         }
     }
 
