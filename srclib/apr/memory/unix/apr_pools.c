@@ -16,6 +16,7 @@
 
 #include "apr.h"
 #include "apr_private.h"
+#include "apr_serenity_internal.h"
 
 #include "apr_atomic.h"
 #include "apr_portable.h" /* for get_os_proc */
@@ -105,9 +106,9 @@ static unsigned int boundary_size;
 #define GUARDPAGE_SIZE 0
 #endif /* APR_ALLOCATOR_GUARD_PAGES */
 
-/* 
+/*
  * Timing constants for killing subprocesses
- * There is a total 3-second delay between sending a SIGINT 
+ * There is a total 3-second delay between sending a SIGINT
  * and sending of the final SIGKILL.
  * TIMEOUT_INTERVAL should be set to TIMEOUT_USECS / 64
  * for the exponetial timeout alogrithm.
@@ -166,7 +167,7 @@ APR_DECLARE(apr_status_t) apr_allocator_create(apr_allocator_t **allocator)
 
     *allocator = NULL;
 
-    if ((new_allocator = malloc(SIZEOF_ALLOCATOR_T)) == NULL)
+    if ((new_allocator = serenity_alloc(NULL, SIZEOF_ALLOCATOR_T)) == NULL)
         return APR_ENOMEM;
 
     memset(new_allocator, 0, SIZEOF_ALLOCATOR_T);
@@ -190,12 +191,12 @@ APR_DECLARE(void) apr_allocator_destroy(apr_allocator_t *allocator)
             munmap((char *)node - GUARDPAGE_SIZE,
                    2 * GUARDPAGE_SIZE + ((node->index+1) << BOUNDARY_INDEX));
 #else
-            free(node);
+            serenity_free(allocator, node, node->endp - (char *)node);
 #endif
         }
     }
 
-    free(allocator);
+    serenity_free(NULL, allocator, sizeof(apr_allocator_t));
 }
 
 #if APR_HAS_THREADS
@@ -277,7 +278,7 @@ APR_DECLARE(apr_size_t) apr_allocator_align(apr_allocator_t *allocator,
 }
 
 static APR_INLINE
-apr_memnode_t *allocator_alloc(apr_allocator_t *allocator, apr_size_t in_size)
+apr_memnode_t *allocator_alloc(apr_allocator_t *allocator, apr_size_t in_size, void *owner)
 {
     apr_memnode_t *node, **ref;
     apr_size_t max_index;
@@ -295,7 +296,7 @@ apr_memnode_t *allocator_alloc(apr_allocator_t *allocator, apr_size_t in_size)
      * dividing its size by the boundary size
      */
     index = (size >> BOUNDARY_INDEX) - 1;
-    
+
     if (index > APR_UINT32_MAX) {
         return NULL;
     }
@@ -408,7 +409,7 @@ apr_memnode_t *allocator_alloc(apr_allocator_t *allocator, apr_size_t in_size)
     if ((node = mmap(NULL, size, PROT_READ|PROT_WRITE,
                      MAP_PRIVATE|MAP_ANON, -1, 0)) == MAP_FAILED)
 #else
-    if ((node = malloc(size)) == NULL)
+    if ((node = serenity_alloc(allocator, size)) == NULL)
 #endif
         return NULL;
 
@@ -428,6 +429,7 @@ have_node:
 
     APR_VALGRIND_UNDEFINED(node->first_avail, size - APR_MEMNODE_T_SIZE);
 
+    serenity_node_allocated(allocator, node, size, owner);
     return node;
 }
 
@@ -437,6 +439,8 @@ void allocator_free(apr_allocator_t *allocator, apr_memnode_t *node)
     apr_memnode_t *next, *freelist = NULL;
     apr_size_t index, max_index;
     apr_size_t max_free_index, current_free_index;
+
+    serenity_node_free(allocator, node, node->endp - (char *)node);
 
 #if APR_HAS_THREADS
     if (allocator->mutex)
@@ -504,7 +508,7 @@ void allocator_free(apr_allocator_t *allocator, apr_memnode_t *node)
         munmap((char *)node - GUARDPAGE_SIZE,
                2 * GUARDPAGE_SIZE + ((node->index+1) << BOUNDARY_INDEX));
 #else
-        free(node);
+        serenity_free(allocator, node, node->endp - (char *)node);
 #endif
     }
 }
@@ -512,7 +516,7 @@ void allocator_free(apr_allocator_t *allocator, apr_memnode_t *node)
 APR_DECLARE(apr_memnode_t *) apr_allocator_alloc(apr_allocator_t *allocator,
                                                  apr_size_t size)
 {
-    return allocator_alloc(allocator, size);
+    return allocator_alloc(allocator, size, NULL);
 }
 
 APR_DECLARE(void) apr_allocator_free(apr_allocator_t *allocator,
@@ -618,6 +622,8 @@ struct apr_pool_t {
     volatile apr_uint32_t in_use;
     apr_os_thread_t       in_use_by;
 #endif /* APR_POOL_CONCURRENCY_CHECK */
+
+    serenity_allocmngr_t alloc_manager;
 };
 
 #define SIZEOF_POOL_T       APR_ALIGN_DEFAULT(sizeof(apr_pool_t))
@@ -849,7 +855,7 @@ APR_DECLARE(void *) apr_palloc(apr_pool_t *pool, apr_size_t in_size)
         list_remove(node);
     }
     else {
-        if ((node = allocator_alloc(pool->allocator, size)) == NULL) {
+        if ((node = allocator_alloc(pool->allocator, size, pool)) == NULL) {
             pool_concurrency_set_idle(pool);
             if (pool->abort_fn)
                 pool->abort_fn(APR_ENOMEM);
@@ -965,6 +971,7 @@ APR_DECLARE(void) apr_pool_clear(apr_pool_t *pool)
 
     APR_IF_VALGRIND(VALGRIND_MEMPOOL_TRIM(pool, pool, 1));
 
+    serenity_allocmngr_clear(pool, &pool->alloc_manager);
     if (active->next == active) {
         pool_concurrency_set_idle(pool);
         return;
@@ -999,7 +1006,7 @@ APR_DECLARE(void) apr_pool_destroy(apr_pool_t *pool)
     /* Run cleanups */
     run_cleanups(&pool->cleanups);
     pool_concurrency_set_destroyed(pool);
-
+    serenity_pool_destroy(pool);
     /* Free subprocesses */
     free_proc_chain(pool->subprocesses);
 
@@ -1077,7 +1084,7 @@ APR_DECLARE(apr_status_t) apr_pool_create_ex(apr_pool_t **newpool,
         allocator = parent->allocator;
 
     if ((node = allocator_alloc(allocator,
-                                MIN_ALLOC - APR_MEMNODE_T_SIZE)) == NULL) {
+                                MIN_ALLOC - APR_MEMNODE_T_SIZE, NULL)) == NULL) {
         if (abort_fn)
             abort_fn(APR_ENOMEM);
 
@@ -1145,7 +1152,7 @@ APR_DECLARE(apr_status_t) apr_pool_create_ex(apr_pool_t **newpool,
     }
 
     pool_concurrency_init(pool);
-
+    serenity_pool_create(pool);
     *newpool = pool;
 
     return APR_SUCCESS;
@@ -1173,7 +1180,7 @@ APR_DECLARE(apr_status_t) apr_pool_create_unmanaged_ex(apr_pool_t **newpool,
     if (!apr_pools_initialized)
         return APR_ENOPOOL;
     if ((pool_allocator = allocator) == NULL) {
-        if ((pool_allocator = malloc(SIZEOF_ALLOCATOR_T)) == NULL) {
+        if ((pool_allocator = serenity_alloc(NULL, SIZEOF_ALLOCATOR_T)) == NULL) {
             if (abort_fn)
                 abort_fn(APR_ENOMEM);
 
@@ -1183,7 +1190,7 @@ APR_DECLARE(apr_status_t) apr_pool_create_unmanaged_ex(apr_pool_t **newpool,
         pool_allocator->max_free_index = APR_ALLOCATOR_MAX_FREE_UNLIMITED;
     }
     if ((node = allocator_alloc(pool_allocator,
-                                MIN_ALLOC - APR_MEMNODE_T_SIZE)) == NULL) {
+                                MIN_ALLOC - APR_MEMNODE_T_SIZE, NULL)) == NULL) {
         if (abort_fn)
             abort_fn(APR_ENOMEM);
 
@@ -1217,6 +1224,7 @@ APR_DECLARE(apr_status_t) apr_pool_create_unmanaged_ex(apr_pool_t **newpool,
         pool_allocator->owner = pool;
 
     pool_concurrency_init(pool);
+    serenity_pool_create(pool);
     *newpool = pool;
 
     return APR_SUCCESS;
@@ -1301,7 +1309,7 @@ static int psprintf_flush(apr_vformatter_buff_t *vbuff)
         node = pool->active;
     }
     else {
-        if ((node = allocator_alloc(pool->allocator, size)) == NULL)
+        if ((node = allocator_alloc(pool->allocator, size, NULL)) == NULL)
             return -1;
 
         if (ps->got_a_new_node) {
@@ -2352,7 +2360,7 @@ APR_DECLARE(apr_abortfunc_t) apr_pool_abort_get(apr_pool_t *pool)
 APR_DECLARE(apr_pool_t *) apr_pool_parent_get(apr_pool_t *pool)
 {
 #ifdef NETWARE
-    /* On NetWare, don't return the global_pool, return the application pool 
+    /* On NetWare, don't return the global_pool, return the application pool
        as the top most pool */
     if (pool->parent == global_pool)
         return pool;
@@ -2662,7 +2670,7 @@ APR_DECLARE(void) apr_pool_cleanup_for_exec(void)
 APR_DECLARE(void) apr_pool_cleanup_for_exec(void)
 {
     /*
-     * Don't need to do anything on NT or OS/2, because 
+     * Don't need to do anything on NT or OS/2, because
      * these platforms will spawn the new process - not
      * fork for exec. All handles that are not inheritable,
      * will be automajically closed. The only problem is
@@ -2930,3 +2938,5 @@ APR_DECLARE(apr_status_t) apr_pool_create_unmanaged_ex(apr_pool_t **newpool,
 }
 
 #endif /* APR_POOL_DEBUG */
+
+#include "apr_serenity.c"
