@@ -64,4 +64,5 @@
 	--enable-ssl-staticlib-deps \
 	--enable-socache-shmcb \
 	--enable-dbd \
-	--enable-mods-static=most
+	--enable-mods-static=most \
+	--enable-systemd

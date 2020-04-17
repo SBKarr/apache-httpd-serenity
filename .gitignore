@@ -84,3 +84,7 @@ support/httxt2dbm
 support/logresolve
 support/rotatelogs
 confdefs.h
+
+*.dep
+*.dsp
+*.mak
