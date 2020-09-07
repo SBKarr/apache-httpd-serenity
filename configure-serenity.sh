@@ -57,6 +57,7 @@
 	--disable-include \
 	--disable-remoteip \
 	--disable-md \
+	--disable-mime \
 	--enable-dbd \
 	--enable-authz-host \
 	--enable-authz-core \
