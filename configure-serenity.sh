@@ -5,8 +5,6 @@
 	--with-included-apr \
 	--disable-session \
 	--disable-dav \
-	--disable-rewrite \
-	--disable-proxy \
 	--disable-auth-digest \
 	--disable-auth_basic \
 	--disable-auth-form \
@@ -65,5 +63,11 @@
 	--enable-ssl-staticlib-deps \
 	--enable-socache-shmcb \
 	--enable-dbd \
-	--enable-mods-static=most \
-	--enable-systemd
+	--enable-systemd \
+	--enable-rewrite \
+	--enable-proxy \
+	--enable-proxy-http \
+	--enable-proxy-wstunnel \
+	--enable-proxy-connect \
+	--enable-slotmem-shm \
+	--enable-mods-static=most
