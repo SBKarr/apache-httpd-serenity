@@ -55,6 +55,12 @@
 #include "apr_global_mutex.h"
 #include "apr_dbm.h"
 #include "apr_dbd.h"
+
+#include "apr_version.h"
+#if !APR_VERSION_AT_LEAST(2,0,0)
+#include "apu_version.h"
+#endif
+
 #include "mod_dbd.h"
 
 #if APR_HAS_THREADS
@@ -93,13 +99,14 @@
 #include "http_core.h"
 #include "http_log.h"
 #include "http_protocol.h"
+#include "http_ssl.h"
 #include "http_vhost.h"
 #include "util_mutex.h"
 
-#include "mod_ssl.h"
-
 #include "mod_rewrite.h"
 #include "ap_expr.h"
+
+#include "test_char.h"
 
 static ap_dbd_t *(*dbd_acquire)(request_rec*) = NULL;
 static void (*dbd_prepare)(server_rec*, const char*, const char*) = NULL;
@@ -168,6 +175,11 @@ static const char* really_last_key = "rewrite_really_last";
 #define RULEFLAG_END                (1<<17)
 #define RULEFLAG_ESCAPENOPLUS       (1<<18)
 #define RULEFLAG_QSLAST             (1<<19)
+#define RULEFLAG_QSNONE             (1<<20) /* programattic only */
+#define RULEFLAG_ESCAPECTLS         (1<<21)
+#define RULEFLAG_UNSAFE_PREFIX_STAT (1<<22)
+#define RULEFLAG_UNSAFE_ALLOW3F     (1<<23)
+#define RULEFLAG_UNC                (1<<24)
 
 /* return code of the rewrite rule
  * the result may be escaped - or not
@@ -175,7 +187,7 @@ static const char* really_last_key = "rewrite_really_last";
 #define ACTION_NORMAL               (1<<0)
 #define ACTION_NOESCAPE             (1<<1)
 #define ACTION_STATUS               (1<<2)
-
+#define ACTION_STATUS_SET           (1<<3)
 
 #define MAPTYPE_TXT                 (1<<0)
 #define MAPTYPE_DBM                 (1<<1)
@@ -199,6 +211,7 @@ static const char* really_last_key = "rewrite_really_last";
 #define OPTION_IGNORE_INHERIT       (1<<8)
 #define OPTION_IGNORE_CONTEXT_INFO  (1<<9)
 #define OPTION_LEGACY_PREFIX_DOCROOT (1<<10)
+#define OPTION_UNSAFE_PREFIX_STAT   (1<<12)
 
 #ifndef RAND_MAX
 #define RAND_MAX 32767
@@ -292,6 +305,14 @@ typedef enum {
     CONDPAT_AP_EXPR
 } pattern_type;
 
+typedef enum {
+  RULE_RC_NOMATCH = 0,      /* the rule didn't match                        */
+  RULE_RC_MATCH = 1,        /* a matching rule w/ substitution              */
+  RULE_RC_NOSUB = 2,        /* a matching rule w/ no substitution           */
+  RULE_RC_STATUS_SET = 3    /* a matching rule that has set an HTTP error
+                               to be returned in r->status */
+} rule_return_type;
+
 typedef struct {
     char           *input;   /* Input string of RewriteCond   */
     char           *pattern; /* the RegExp pattern string     */
@@ -321,7 +342,8 @@ typedef struct {
     data_item *cookie;               /* added cookies                         */
     int        skip;                 /* number of next rules to skip          */
     int        maxrounds;            /* limit on number of loops with N flag  */
-    char       *escapes;             /* specific backref escapes              */
+    const char *escapes;             /* specific backref escapes              */
+    const char *noescapes;           /* specific backref chars not to escape  */
 } rewriterule_entry;
 
 typedef struct {
@@ -421,9 +443,9 @@ static apr_global_mutex_t *rewrite_mapr_lock_acquire = NULL;
 static const char *rewritemap_mutex_type = "rewrite-map";
 
 /* Optional functions imported from mod_ssl when loaded: */
-static APR_OPTIONAL_FN_TYPE(ssl_var_lookup) *rewrite_ssl_lookup = NULL;
-static APR_OPTIONAL_FN_TYPE(ssl_is_https) *rewrite_is_https = NULL;
-static char *escape_backref(apr_pool_t *p, const char *path, const char *escapeme, int noplus);
+static char *escape_backref(apr_pool_t *p, const char *path,
+                            const char *escapeme, const char *noescapeme,
+                            int flags);
 
 /*
  * +-------------------------------------------------------+
@@ -524,7 +546,7 @@ static unsigned is_absolute_uri(char *uri, int *supportsqs)
     switch (*uri++) {
     case 'a':
     case 'A':
-        if (!strncasecmp(uri, "jp://", 5)) {        /* ajp://    */
+        if (!ap_cstr_casecmpn(uri, "jp://", 5)) {        /* ajp://    */
           *sqs = 1;
           return 6;
         }
@@ -532,7 +554,7 @@ static unsigned is_absolute_uri(char *uri, int *supportsqs)
 
     case 'b':
     case 'B':
-        if (!strncasecmp(uri, "alancer://", 10)) {   /* balancer:// */
+        if (!ap_cstr_casecmpn(uri, "alancer://", 10)) {   /* balancer:// */
           *sqs = 1;
           return 11;
         }
@@ -540,10 +562,10 @@ static unsigned is_absolute_uri(char *uri, int *supportsqs)
 
     case 'f':
     case 'F':
-        if (!strncasecmp(uri, "tp://", 5)) {        /* ftp://    */
+        if (!ap_cstr_casecmpn(uri, "tp://", 5)) {        /* ftp://    */
             return 6;
         }
-        if (!strncasecmp(uri, "cgi://", 6)) {       /* fcgi://   */
+        if (!ap_cstr_casecmpn(uri, "cgi://", 6)) {       /* fcgi://   */
             *sqs = 1;
             return 7;
         }
@@ -551,26 +573,26 @@ static unsigned is_absolute_uri(char *uri, int *supportsqs)
 
     case 'g':
     case 'G':
-        if (!strncasecmp(uri, "opher://", 8)) {     /* gopher:// */
+        if (!ap_cstr_casecmpn(uri, "opher://", 8)) {     /* gopher:// */
             return 9;
         }
         break;
 
     case 'h':
     case 'H':
-        if (!strncasecmp(uri, "ttp://", 6)) {       /* http://   */
+        if (!ap_cstr_casecmpn(uri, "ttp://", 6)) {       /* http://   */
             *sqs = 1;
             return 7;
         }
-        else if (!strncasecmp(uri, "ttps://", 7)) { /* https://  */
+        else if (!ap_cstr_casecmpn(uri, "ttps://", 7)) { /* https://  */
             *sqs = 1;
             return 8;
         }
-        else if (!strncasecmp(uri, "2://", 4)) {    /* h2://     */
+        else if (!ap_cstr_casecmpn(uri, "2://", 4)) {    /* h2://     */
             *sqs = 1;
             return 5;
         }
-        else if (!strncasecmp(uri, "2c://", 5)) {   /* h2c://    */
+        else if (!ap_cstr_casecmpn(uri, "2c://", 5)) {   /* h2c://    */
             *sqs = 1;
             return 6;
         }
@@ -578,14 +600,14 @@ static unsigned is_absolute_uri(char *uri, int *supportsqs)
 
     case 'l':
     case 'L':
-        if (!strncasecmp(uri, "dap://", 6)) {       /* ldap://   */
+        if (!ap_cstr_casecmpn(uri, "dap://", 6)) {       /* ldap://   */
             return 7;
         }
         break;
 
     case 'm':
     case 'M':
-        if (!strncasecmp(uri, "ailto:", 6)) {       /* mailto:   */
+        if (!ap_cstr_casecmpn(uri, "ailto:", 6)) {       /* mailto:   */
             *sqs = 1;
             return 7;
         }
@@ -593,17 +615,17 @@ static unsigned is_absolute_uri(char *uri, int *supportsqs)
 
     case 'n':
     case 'N':
-        if (!strncasecmp(uri, "ews:", 4)) {         /* news:     */
+        if (!ap_cstr_casecmpn(uri, "ews:", 4)) {         /* news:     */
             return 5;
         }
-        else if (!strncasecmp(uri, "ntp://", 6)) {  /* nntp://   */
+        else if (!ap_cstr_casecmpn(uri, "ntp://", 6)) {  /* nntp://   */
             return 7;
         }
         break;
 
     case 's':
     case 'S':
-        if (!strncasecmp(uri, "cgi://", 6)) {       /* scgi://   */
+        if (!ap_cstr_casecmpn(uri, "cgi://", 6)) {       /* scgi://   */
             *sqs = 1;
             return 7;
         }
@@ -611,18 +633,35 @@ static unsigned is_absolute_uri(char *uri, int *supportsqs)
 
     case 'w':
     case 'W':
-        if (!strncasecmp(uri, "s://", 4)) {        /* ws://     */
+        if (!ap_cstr_casecmpn(uri, "s://", 4)) {        /* ws://     */
             *sqs = 1;
             return 5;
         }
-        else if (!strncasecmp(uri, "ss://", 5)) {  /* wss://    */
+        else if (!ap_cstr_casecmpn(uri, "ss://", 5)) {  /* wss://    */
             *sqs = 1;
             return 6;
         }
         break;
+
+    case 'u':
+    case 'U':
+        if (!ap_cstr_casecmpn(uri, "nix:", 4)) {        /* unix:     */
+            *sqs = 1;
+            return (uri[4] == '/' && uri[5] == '/') ? 7 : 5;
+        }
     }
 
     return 0;
+}
+
+static int is_absolute_path(const char *path)
+{
+#ifndef CASE_BLIND_FILESYSTEM
+    return (path[0] == '/');
+#else
+    return ((AP_IS_SLASH(path[0]) && path[1] == path[0])
+            || (apr_isalpha(path[0]) && path[1] == ':' && AP_IS_SLASH(path[2])));
+#endif
 }
 
 static const char c2x_table[] = "0123456789abcdef";
@@ -643,14 +682,21 @@ static APR_INLINE unsigned char *c2x(unsigned what, unsigned char prefix,
  * Escapes a backreference in a similar way as php's urlencode does.
  * Based on ap_os_escape_path in server/util.c
  */
-static char *escape_backref(apr_pool_t *p, const char *path, const char *escapeme, int noplus) {
-    char *copy = apr_palloc(p, 3 * strlen(path) + 3);
+static char *escape_backref(apr_pool_t *p, const char *path,
+                            const char *escapeme, const char *noescapeme,
+                            int flags)
+{
+    char *copy = apr_palloc(p, 3 * strlen(path) + 1);
     const unsigned char *s = (const unsigned char *)path;
     unsigned char *d = (unsigned char *)copy;
-    unsigned c;
+    int noplus = (flags & RULEFLAG_ESCAPENOPLUS) != 0;
+    int ctls = (flags & RULEFLAG_ESCAPECTLS) != 0;
+    unsigned char c;
 
     while ((c = *s)) {
-        if (!escapeme) { 
+        if (((ctls ? !TEST_CHAR(c, T_VCHAR_OBSTEXT) : !escapeme)
+             || (escapeme && ap_strchr_c(escapeme, c)))
+            && (!noescapeme || !ap_strchr_c(noescapeme, c))) {
             if (apr_isalnum(c) || c == '_') {
                 *d++ = c;
             }
@@ -661,23 +707,8 @@ static char *escape_backref(apr_pool_t *p, const char *path, const char *escapem
                 d = c2x(c, '%', d);
             }
         }
-        else { 
-            const char *esc = escapeme;
-            while (*esc) { 
-                if (c == *esc) { 
-                    if (c == ' ' && !noplus) { 
-                        *d++ = '+';
-                    }
-                    else { 
-                        d = c2x(c, '%', d);
-                    }
-                    break;
-                }
-                ++esc;
-            }
-            if (!*esc) { 
-                *d++ = c;
-            }
+        else {
+            *d++ = c;
         }
         ++s;
     }
@@ -723,7 +754,7 @@ static char *escape_absolute_uri(apr_pool_t *p, char *uri, unsigned scheme)
          *               [dn ["?" [attributes] ["?" [scope]
          *               ["?" [filter] ["?" extensions]]]]]]
          */
-        if (!strncasecmp(uri, "ldap", 4)) {
+        if (!ap_cstr_casecmpn(uri, "ldap", 4)) {
             char *token[5];
             int c = 0;
 
@@ -759,27 +790,35 @@ static char *escape_absolute_uri(apr_pool_t *p, char *uri, unsigned scheme)
  * split out a QUERY_STRING part from
  * the current URI string
  */
-static void splitout_queryargs(request_rec *r, int qsappend, int qsdiscard, 
-                               int qslast)
+static void splitout_queryargs(request_rec *r, int flags)
 {
     char *q;
-    int split;
+    int split, skip;
+    int qsappend = flags & RULEFLAG_QSAPPEND;
+    int qsdiscard = flags & RULEFLAG_QSDISCARD;
+    int qslast = flags & RULEFLAG_QSLAST;
+
+    if (flags & RULEFLAG_QSNONE) {
+        rewritelog((r, 2, NULL, "discarding query string, no parse from substitution"));
+        r->args = NULL;
+        return;
+    }
 
     /* don't touch, unless it's a scheme for which a query string makes sense.
      * See RFC 1738 and RFC 2368.
      */
-    if (is_absolute_uri(r->filename, &split)
+    if ((skip = is_absolute_uri(r->filename, &split))
         && !split) {
         r->args = NULL; /* forget the query that's still flying around */
         return;
     }
 
-    if ( qsdiscard ) {
+    if (qsdiscard) {
         r->args = NULL; /* Discard query string */
         rewritelog((r, 2, NULL, "discarding query string"));
     }
 
-    q = qslast ? ap_strrchr(r->filename, '?') : ap_strchr(r->filename, '?');
+    q = qslast ? ap_strrchr(r->filename + skip, '?') : ap_strchr(r->filename + skip, '?');
 
     if (q != NULL) {
         char *olduri;
@@ -788,7 +827,7 @@ static void splitout_queryargs(request_rec *r, int qsappend, int qsdiscard,
         olduri = apr_pstrdup(r->pool, r->filename);
         *q++ = '\0';
         if (qsappend) {
-            if (*q) { 
+            if (*q) {
                 r->args = apr_pstrcat(r->pool, q, "&" , r->args, NULL);
             }
         }
@@ -796,9 +835,9 @@ static void splitout_queryargs(request_rec *r, int qsappend, int qsdiscard,
             r->args = apr_pstrdup(r->pool, q);
         }
 
-        if (r->args) { 
+        if (r->args) {
            len = strlen(r->args);
-      
+
            if (!len) {
                r->args = NULL;
            }
@@ -810,8 +849,6 @@ static void splitout_queryargs(request_rec *r, int qsappend, int qsdiscard,
         rewritelog((r, 3, NULL, "split uri=%s -> uri=%s, args=%s", olduri,
                     r->filename, r->args ? r->args : "<none>"));
     }
-
-    return;
 }
 
 /*
@@ -825,7 +862,7 @@ static void reduce_uri(request_rec *r)
     cp = (char *)ap_http_scheme(r);
     l  = strlen(cp);
     if (   strlen(r->filename) > l+3
-        && strncasecmp(r->filename, cp, l) == 0
+        && ap_cstr_casecmpn(r->filename, cp, l) == 0
         && r->filename[l]   == ':'
         && r->filename[l+1] == '/'
         && r->filename[l+2] == '/' ) {
@@ -912,10 +949,15 @@ static void fully_qualify_uri(request_rec *r)
     return;
 }
 
+static int startsWith(request_rec *r, const char *haystack, const char *needle) {
+    int rc = (ap_strstr_c(haystack, needle) == haystack);
+    rewritelog((r, 5, NULL, "prefix_stat startsWith(%s, %s) %d", haystack, needle, rc));
+    return rc;
+}
 /*
- * stat() only the first segment of a path
+ * stat() only the first segment of a path, and only if it matches the output of the last matching rule
  */
-static int prefix_stat(const char *path, apr_pool_t *pool)
+static int prefix_stat(request_rec *r, const char *path, apr_pool_t *pool, rewriterule_entry *lastsub)
 {
     const char *curpath = path;
     const char *root;
@@ -949,10 +991,36 @@ static int prefix_stat(const char *path, apr_pool_t *pool)
         apr_finfo_t sb;
 
         if (apr_stat(&sb, statpath, APR_FINFO_MIN, pool) == APR_SUCCESS) {
-            return 1;
+            if (!lastsub) {
+                rewritelog((r, 3, NULL, "prefix_stat no lastsub subst prefix %s", statpath));
+                return 1;
+            }
+
+            rewritelog((r, 3, NULL, "prefix_stat compare statpath %s and lastsub output %s STATOK %d ",
+                    statpath, lastsub->output, lastsub->flags & RULEFLAG_UNSAFE_PREFIX_STAT));
+            if (lastsub->flags & RULEFLAG_UNSAFE_PREFIX_STAT) {
+                return 1;
+            }
+            else {
+                const char *docroot = ap_document_root(r);
+                const char *context_docroot = ap_context_document_root(r);
+                /*
+                 * As an example, path (r->filename) is /var/foo/bar/baz.html
+                 * even if the flag is not set,  we can accept a rule that
+                 * began with a literal /var (stapath), or if the entire path
+                 * starts with the docroot or context document root
+                 */
+                if (startsWith(r, lastsub->output, statpath) ||
+                        startsWith(r, path, docroot) ||
+                        ((docroot != context_docroot) &&
+                          startsWith(r, path, context_docroot))) {
+                    return 1;
+                }
+            }
         }
     }
 
+    /* prefix will be added */
     return 0;
 }
 
@@ -1029,6 +1097,7 @@ static void set_cache_value(const char *name, apr_time_t t, char *key,
 #endif
                 return;
             }
+            apr_pool_tag(p, "rewrite_cachedmap");
 
             map = apr_palloc(cachep->pool, sizeof(cachedmap));
             map->pool = p;
@@ -1106,6 +1175,7 @@ static int init_cache(apr_pool_t *p)
         cachep = NULL; /* turns off cache */
         return 0;
     }
+    apr_pool_tag(cachep->pool, "rewrite_cachep");
 
     cachep->maps = apr_hash_make(cachep->pool);
 #if APR_HAS_THREADS
@@ -1353,12 +1423,31 @@ static char *lookup_map_txtfile(request_rec *r, const char *file, char *key)
 static char *lookup_map_dbmfile(request_rec *r, const char *file,
                                 const char *dbmtype, char *key)
 {
+#if APU_MAJOR_VERSION > 1 || (APU_MAJOR_VERSION == 1 && APU_MINOR_VERSION >= 7)
+    const apr_dbm_driver_t *driver;
+    const apu_err_t *err;
+#endif
     apr_dbm_t *dbmfp = NULL;
     apr_datum_t dbmkey;
     apr_datum_t dbmval;
     char *value;
     apr_status_t rv;
 
+#if APU_MAJOR_VERSION > 1 || (APU_MAJOR_VERSION == 1 && APU_MINOR_VERSION >= 7)
+    if ((rv = apr_dbm_get_driver(&driver, dbmtype, &err,
+            r->pool)) != APR_SUCCESS) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO(10287)
+                "mod_rewrite: can't load DBM library '%s': %s",
+                     err->reason, err->msg);
+        return NULL;
+    }
+    if ((rv = apr_dbm_open2(&dbmfp, driver, file, APR_DBM_READONLY,
+                              APR_OS_DEFAULT, r->pool)) != APR_SUCCESS) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO(00656)
+                      "mod_rewrite: can't open DBM RewriteMap %s", file);
+        return NULL;
+    }
+#else
     if ((rv = apr_dbm_open_ex(&dbmfp, dbmtype, file, APR_DBM_READONLY,
                               APR_OS_DEFAULT, r->pool)) != APR_SUCCESS)
     {
@@ -1366,6 +1455,7 @@ static char *lookup_map_dbmfile(request_rec *r, const char *file,
                       "mod_rewrite: can't open DBM RewriteMap %s", file);
         return NULL;
     }
+#endif
 
     dbmkey.dptr  = key;
     dbmkey.dsize = strlen(key);
@@ -1864,8 +1954,8 @@ static char *lookup_variable(char *var, rewrite_ctx *ctx)
                 result = getenv(var);
             }
         }
-        else if (var[4] && !strncasecmp(var, "SSL", 3) && rewrite_ssl_lookup) {
-            result = rewrite_ssl_lookup(r->pool, r->server, r->connection, r,
+        else if (var[4] && !strncasecmp(var, "SSL", 3)) {
+            result = ap_ssl_var_lookup(r->pool, r->server, r->connection, r,
                                         var + 4);
         }
     }
@@ -1963,7 +2053,7 @@ static char *lookup_variable(char *var, rewrite_ctx *ctx)
 
         case  5:
             if (!strcmp(var, "HTTPS")) {
-                int flag = rewrite_is_https && rewrite_is_https(r->connection);
+                int flag = ap_ssl_conn_is_ssl(r->connection);
                 return apr_pstrdup(r->pool, flag ? "on" : "off");
             }
             break;
@@ -2430,7 +2520,8 @@ static char *do_expand(char *input, rewrite_ctx *ctx, rewriterule_entry *entry)
                     /* escape the backreference */
                     char *tmp2, *tmp;
                     tmp = apr_pstrmemdup(pool, bri->source + bri->regmatch[n].rm_so, span);
-                    tmp2 = escape_backref(pool, tmp, entry->escapes, entry->flags & RULEFLAG_ESCAPENOPLUS);
+                    tmp2 = escape_backref(pool, tmp, entry->escapes, entry->noescapes,
+                                          entry->flags);
                     rewritelog((ctx->r, 5, ctx->perdir, "escaping backreference '%s' to '%s'",
                             tmp, tmp2));
 
@@ -2538,6 +2629,7 @@ static void add_cookie(request_rec *r, char *s)
     char *path;
     char *secure;
     char *httponly;
+    char *samesite;
 
     char *tok_cntx;
     char *cookie;
@@ -2572,6 +2664,7 @@ static void add_cookie(request_rec *r, char *s)
             path = expires ? apr_strtok(NULL, sep, &tok_cntx) : NULL;
             secure = path ? apr_strtok(NULL, sep, &tok_cntx) : NULL;
             httponly = secure ? apr_strtok(NULL, sep, &tok_cntx) : NULL;
+            samesite = httponly ? apr_strtok(NULL, sep, &tok_cntx) : NULL;
 
             if (expires) {
                 apr_time_exp_t tms;
@@ -2599,17 +2692,22 @@ static void add_cookie(request_rec *r, char *s)
                                  : NULL,
                                  expires ? (exp_time ? exp_time : "")
                                  : NULL,
-                                 (secure && (!strcasecmp(secure, "true")
+                                 (secure && (!ap_cstr_casecmp(secure, "true")
                                              || !strcmp(secure, "1")
-                                             || !strcasecmp(secure,
+                                             || !ap_cstr_casecmp(secure,
                                                             "secure"))) ?
                                   "; secure" : NULL,
-                                 (httponly && (!strcasecmp(httponly, "true")
+                                 (httponly && (!ap_cstr_casecmp(httponly, "true")
                                                || !strcmp(httponly, "1")
-                                               || !strcasecmp(httponly,
+                                               || !ap_cstr_casecmp(httponly,
                                                               "HttpOnly"))) ?
                                   "; HttpOnly" : NULL,
                                  NULL);
+
+            if (samesite && strcmp(samesite, "0") && ap_cstr_casecmp(samesite,"false")) { 
+                cookie = apr_pstrcat(rmain->pool, cookie, "; SameSite=", 
+                                     samesite, NULL);
+            }
 
             apr_table_addn(rmain->err_headers_out, "Set-Cookie", cookie);
             apr_pool_userdata_set("set", notename, NULL, rmain->pool);
@@ -2724,7 +2822,7 @@ static apr_status_t rewritelock_remove(void *data)
  * XXX: what an inclined parser. Seems we have to leave it so
  *      for backwards compat. *sigh*
  */
-static int parseargline(char *str, char **a1, char **a2, char **a3)
+static int parseargline(char *str, char **a1, char **a2, char **a2_end, char **a3)
 {
     char quote;
 
@@ -2775,8 +2873,10 @@ static int parseargline(char *str, char **a1, char **a2, char **a3)
 
     if (!*str) {
         *a3 = NULL; /* 3rd argument is optional */
+        *a2_end = str;
         return 0;
     }
+    *a2_end = str;
     *str++ = '\0';
 
     while (apr_isspace(*str)) {
@@ -3024,6 +3124,9 @@ static const char *cmd_rewriteoptions(cmd_parms *cmd,
         }
         else if (!strcasecmp(w, "legacyprefixdocroot")) {
             options |= OPTION_LEGACY_PREFIX_DOCROOT;
+        }
+        else if (!strcasecmp(w, "UnsafePrefixStat")) {
+            options |= OPTION_UNSAFE_PREFIX_STAT;
         }
         else {
             return apr_pstrcat(cmd->pool, "RewriteOptions: unknown option '",
@@ -3316,7 +3419,7 @@ static const char *cmd_rewritecond(cmd_parms *cmd, void *in_dconf,
     rewrite_server_conf *sconf;
     rewritecond_entry *newcond;
     ap_regex_t *regexp;
-    char *a1 = NULL, *a2 = NULL, *a3 = NULL;
+    char *a1 = NULL, *a2 = NULL, *a2_end, *a3 = NULL;
     const char *err;
 
     sconf = ap_get_module_config(cmd->server->module_config, &rewrite_module);
@@ -3334,7 +3437,7 @@ static const char *cmd_rewritecond(cmd_parms *cmd, void *in_dconf,
      * of the argument line. So we can use a1 .. a3 without
      * copying them again.
      */
-    if (parseargline(str, &a1, &a2, &a3)) {
+    if (parseargline(str, &a1, &a2, &a2_end, &a3)) {
         return apr_pstrcat(cmd->pool, "RewriteCond: bad argument line '", str,
                            "'", NULL);
     }
@@ -3493,12 +3596,23 @@ static const char *cmd_rewriterule_setflag(apr_pool_t *p, void *_cfg,
     case 'B':
         if (!*key || !strcasecmp(key, "ackrefescaping")) {
             cfg->flags |= RULEFLAG_ESCAPEBACKREF;
-            if (val && *val) { 
+            if (val && *val) {
                 cfg->escapes = val;
+            }
+        }
+        else if (!strcasecmp(key, "NE")) {
+            if (val && *val) {
+                cfg->noescapes = val;
+            }
+            else {
+                return "flag 'BNE' wants a list of characters (i.e. [BNE=...])";
             }
         }
         else if (!strcasecmp(key, "NP") || !strcasecmp(key, "ackrefernoplus")) { 
             cfg->flags |= RULEFLAG_ESCAPENOPLUS;
+        }
+        else if (!strcasecmp(key, "CTLS")) {
+            cfg->flags |= RULEFLAG_ESCAPECTLS|RULEFLAG_ESCAPEBACKREF;
         }
         else {
             ++error;
@@ -3722,6 +3836,21 @@ static const char *cmd_rewriterule_setflag(apr_pool_t *p, void *_cfg,
             ++error;
         }
         break;
+    case 'u':
+    case 'U':
+        if (!strcasecmp(key, "nsafePrefixStat")){
+            cfg->flags |= (RULEFLAG_UNSAFE_PREFIX_STAT);
+        }
+        else if(!strcasecmp(key, "nsafeAllow3F")) {
+            cfg->flags |= RULEFLAG_UNSAFE_ALLOW3F;
+        }
+        else if(!strcasecmp(key, "NC")) {
+            cfg->flags |= RULEFLAG_UNC;
+        }
+        else {
+            ++error;
+        }
+        break;
     default:
         ++error;
         break;
@@ -3742,7 +3871,7 @@ static const char *cmd_rewriterule(cmd_parms *cmd, void *in_dconf,
     rewrite_server_conf *sconf;
     rewriterule_entry *newrule;
     ap_regex_t *regexp;
-    char *a1 = NULL, *a2 = NULL, *a3 = NULL;
+    char *a1 = NULL, *a2 = NULL, *a2_end, *a3 = NULL;
     const char *err;
 
     sconf = ap_get_module_config(cmd->server->module_config, &rewrite_module);
@@ -3756,12 +3885,11 @@ static const char *cmd_rewriterule(cmd_parms *cmd, void *in_dconf,
     }
 
     /*  parse the argument line ourself */
-    if (parseargline(str, &a1, &a2, &a3)) {
+    if (parseargline(str, &a1, &a2, &a2_end, &a3)) {
         return apr_pstrcat(cmd->pool, "RewriteRule: bad argument line '", str,
                            "'", NULL);
     }
 
-    /* arg3: optional flags field */
     newrule->forced_mimetype     = NULL;
     newrule->forced_handler      = NULL;
     newrule->forced_responsecode = HTTP_MOVED_TEMPORARILY;
@@ -3770,6 +3898,9 @@ static const char *cmd_rewriterule(cmd_parms *cmd, void *in_dconf,
     newrule->cookie = NULL;
     newrule->skip   = 0;
     newrule->maxrounds = REWRITE_MAX_ROUNDS;
+    newrule->escapes = newrule->noescapes = NULL;
+
+    /* arg3: optional flags field */
     if (a3 != NULL) {
         if ((err = cmd_parseflagfield(cmd->pool, newrule, a3,
                                       cmd_rewriterule_setflag)) != NULL) {
@@ -3801,6 +3932,25 @@ static const char *cmd_rewriterule(cmd_parms *cmd, void *in_dconf,
     newrule->output = a2;
     if (*a2 == '-' && !a2[1]) {
         newrule->flags |= RULEFLAG_NOSUB;
+    }
+
+    if (*(a2_end-1) == '?') {
+        /* a literal ? at the end of the unsubstituted rewrite rule */
+        if (newrule->flags & RULEFLAG_QSAPPEND) {
+           /* with QSA, splitout_queryargs will safely handle it if RULEFLAG_QSLAST is set */
+           newrule->flags |= RULEFLAG_QSLAST;
+        }
+        else {
+            /* avoid getting a query string via inadvertent capture */
+            newrule->flags |= RULEFLAG_QSNONE;
+            /* trailing ? has done its job, but splitout_queryargs will not chop it off */
+            *(a2_end-1) = '\0';
+       }
+    }
+    else if (newrule->flags & RULEFLAG_QSDISCARD) {
+        if (NULL == ap_strchr(newrule->output, '?')) {
+            newrule->flags |= RULEFLAG_QSNONE;
+        }
     }
 
     /* now, if the server or per-dir config holds an
@@ -4059,7 +4209,8 @@ static APR_INLINE void force_type_handler(rewriterule_entry *p,
 /*
  * Apply a single RewriteRule
  */
-static int apply_rewrite_rule(rewriterule_entry *p, rewrite_ctx *ctx)
+static rule_return_type apply_rewrite_rule(rewriterule_entry *p,
+                                           rewrite_ctx *ctx)
 {
     ap_regmatch_t regmatch[AP_MAX_REG_MATCH];
     apr_array_header_t *rewriteconds;
@@ -4110,7 +4261,7 @@ static int apply_rewrite_rule(rewriterule_entry *p, rewrite_ctx *ctx)
     rc = !ap_regexec(p->regexp, ctx->uri, AP_MAX_REG_MATCH, regmatch, 0);
     if (! (( rc && !(p->flags & RULEFLAG_NOTMATCH)) ||
            (!rc &&  (p->flags & RULEFLAG_NOTMATCH))   ) ) {
-        return 0;
+        return RULE_RC_NOMATCH;
     }
 
     /* It matched, wow! Now it's time to prepare the context structure for
@@ -4161,7 +4312,7 @@ static int apply_rewrite_rule(rewriterule_entry *p, rewrite_ctx *ctx)
             }
         }
         else if (!rc) {
-            return 0;
+            return RULE_RC_NOMATCH;
         }
 
         /* If some HTTP header was involved in the condition, remember it
@@ -4181,6 +4332,15 @@ static int apply_rewrite_rule(rewriterule_entry *p, rewrite_ctx *ctx)
         newuri = do_expand(p->output, ctx, p);
         rewritelog((r, 2, ctx->perdir, "rewrite '%s' -> '%s'", ctx->uri,
                     newuri));
+        if (!(p->flags & RULEFLAG_UNSAFE_ALLOW3F) &&
+            ap_strcasestr(r->unparsed_uri, "%3f") &&
+            ap_strchr_c(newuri, '?')) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(10508)
+                    "Unsafe URL with %%3f URL rewritten without "
+                    "UnsafeAllow3F");
+            r->status = HTTP_FORBIDDEN;
+            return RULE_RC_STATUS_SET;
+        }
     }
 
     /* expand [E=var:val] and [CO=<cookie>] */
@@ -4198,7 +4358,35 @@ static int apply_rewrite_rule(rewriterule_entry *p, rewrite_ctx *ctx)
             r->status = p->forced_responsecode;
         }
 
-        return 2;
+        return RULE_RC_NOSUB;
+    }
+
+    /* Add the previously stripped per-directory location prefix, unless
+     * (1) it's an absolute URL path and
+     * (2) it's a full qualified URL
+     */
+    if (!is_proxyreq
+        && !is_absolute_path(newuri)
+        && !AP_IS_SLASH(*newuri)
+        && !is_absolute_uri(newuri, NULL)) {
+        if (ctx->perdir) {
+            rewritelog((r, 3, ctx->perdir, "add per-dir prefix: %s -> %s%s",
+                       newuri, ctx->perdir, newuri));
+            newuri = apr_pstrcat(r->pool, ctx->perdir, newuri, NULL);
+        }
+        else if (!(p->flags & (RULEFLAG_PROXY | RULEFLAG_FORCEREDIRECT))) {
+            /* Not an absolute URI-path and the scheme (if any) is unknown,
+             * and it won't be passed to fully_qualify_uri() below either,
+             * so add an implicit '/' prefix. This avoids potentially a common
+             * rule like "RewriteRule ^/some/path(.*) $1" that is given a path
+             * like "/some/pathscheme:..." to produce the fully qualified URL
+             * "scheme:..." which could be misinterpreted later.
+             */
+            rewritelog((r, 3, ctx->perdir, "add root prefix: %s -> /%s",
+                       newuri, newuri));
+
+            newuri = apr_pstrcat(r->pool, "/", newuri, NULL);
+        }
     }
 
     /* Now adjust API's knowledge about r->filename and r->args */
@@ -4208,21 +4396,7 @@ static int apply_rewrite_rule(rewriterule_entry *p, rewrite_ctx *ctx)
         r->path_info = NULL;
     }
 
-    splitout_queryargs(r, p->flags & RULEFLAG_QSAPPEND, 
-                          p->flags & RULEFLAG_QSDISCARD, 
-                          p->flags & RULEFLAG_QSLAST);
-
-    /* Add the previously stripped per-directory location prefix, unless
-     * (1) it's an absolute URL path and
-     * (2) it's a full qualified URL
-     */
-    if (   ctx->perdir && !is_proxyreq && *r->filename != '/'
-        && !is_absolute_uri(r->filename, NULL)) {
-        rewritelog((r, 3, ctx->perdir, "add per-dir prefix: %s -> %s%s",
-                    r->filename, ctx->perdir, r->filename));
-
-        r->filename = apr_pstrcat(r->pool, ctx->perdir, r->filename, NULL);
-    }
+    splitout_queryargs(r, p->flags);
 
     /* If this rule is forced for proxy throughput
      * (`RewriteRule ... ... [P]') then emulate mod_proxy's
@@ -4252,7 +4426,7 @@ static int apply_rewrite_rule(rewriterule_entry *p, rewrite_ctx *ctx)
                     r->filename));
 
         r->filename = apr_pstrcat(r->pool, "proxy:", r->filename, NULL);
-        return 1;
+        return RULE_RC_MATCH;
     }
 
     /* If this rule is explicitly forced for HTTP redirection
@@ -4267,7 +4441,7 @@ static int apply_rewrite_rule(rewriterule_entry *p, rewrite_ctx *ctx)
                     r->filename));
 
         r->status = p->forced_responsecode;
-        return 1;
+        return RULE_RC_MATCH;
     }
 
     /* Special Rewriting Feature: Self-Reduction
@@ -4289,7 +4463,17 @@ static int apply_rewrite_rule(rewriterule_entry *p, rewrite_ctx *ctx)
                     "with %s", p->forced_responsecode, r->filename));
 
         r->status = p->forced_responsecode;
-        return 1;
+        return RULE_RC_MATCH;
+    }
+
+    if (!(p->flags & RULEFLAG_UNC)) {
+        /* merge leading slashes, unless they were literals in the sub */
+        if (!AP_IS_SLASH(p->output[0]) || !AP_IS_SLASH(p->output[1])) {
+            while (AP_IS_SLASH(r->filename[0]) &&
+                   AP_IS_SLASH(r->filename[1])) {
+                r->filename++;
+            }
+        }
     }
 
     /* Finally remember the forced mime-type */
@@ -4298,7 +4482,7 @@ static int apply_rewrite_rule(rewriterule_entry *p, rewrite_ctx *ctx)
     /* Puuhhhhhhhh... WHAT COMPLICATED STUFF ;_)
      * But now we're done for this particular rule.
      */
-    return 1;
+    return RULE_RC_MATCH;
 }
 
 /*
@@ -4306,13 +4490,13 @@ static int apply_rewrite_rule(rewriterule_entry *p, rewrite_ctx *ctx)
  * i.e. a list of rewrite rules
  */
 static int apply_rewrite_list(request_rec *r, apr_array_header_t *rewriterules,
-                              char *perdir)
+                              char *perdir, rewriterule_entry **lastsub)
 {
     rewriterule_entry *entries;
     rewriterule_entry *p;
     int i;
     int changed;
-    int rc;
+    rule_return_type rc;
     int s;
     rewrite_ctx *ctx;
     int round = 1;
@@ -4320,6 +4504,7 @@ static int apply_rewrite_list(request_rec *r, apr_array_header_t *rewriterules,
     ctx = apr_palloc(r->pool, sizeof(*ctx));
     ctx->perdir = perdir;
     ctx->r = r;
+    *lastsub = NULL;
 
     /*
      *  Iterate over all existing rules
@@ -4347,7 +4532,12 @@ static int apply_rewrite_list(request_rec *r, apr_array_header_t *rewriterules,
         ctx->vary = NULL;
         rc = apply_rewrite_rule(p, ctx);
 
-        if (rc) {
+        if (rc != RULE_RC_NOMATCH) {
+
+            if (!(p->flags & RULEFLAG_NOSUB)) {
+                rewritelog((r, 2, perdir, "setting lastsub to rule with output %s", p->output));
+                *lastsub = p;
+            }
 
             /* Catch looping rules with pathinfo growing unbounded */
             if ( strlen( r->filename ) > 2*r->server->limit_req_line ) {
@@ -4367,6 +4557,12 @@ static int apply_rewrite_list(request_rec *r, apr_array_header_t *rewriterules,
                 apr_table_merge(r->headers_out, "Vary", ctx->vary);
             }
 
+
+            /* Error while evaluating rule, r->status set */
+            if (RULE_RC_STATUS_SET == rc) {
+                return ACTION_STATUS_SET;
+            }
+
             /*
              * The rule sets the response code (implies match-only)
              */
@@ -4377,7 +4573,7 @@ static int apply_rewrite_list(request_rec *r, apr_array_header_t *rewriterules,
             /*
              * Indicate a change if this was not a match-only rule.
              */
-            if (rc != 2) {
+            if (rc != RULE_RC_NOSUB) {
                 changed = ((p->flags & RULEFLAG_NOESCAPE)
                            ? ACTION_NOESCAPE : ACTION_NORMAL);
             }
@@ -4516,9 +4712,6 @@ static int post_config(apr_pool_t *p,
         }
     }
 
-    rewrite_ssl_lookup = APR_RETRIEVE_OPTIONAL_FN(ssl_var_lookup);
-    rewrite_is_https = APR_RETRIEVE_OPTIONAL_FN(ssl_is_https);
-
     return OK;
 }
 
@@ -4569,6 +4762,7 @@ static int hook_uri2file(request_rec *r)
     int rulestatus;
     void *skipdata;
     const char *oargs;
+    rewriterule_entry *lastsub = NULL;
 
     /*
      *  retrieve the config structures
@@ -4680,7 +4874,7 @@ static int hook_uri2file(request_rec *r)
         /*
          *  now apply the rules ...
          */
-        rulestatus = apply_rewrite_list(r, conf->rewriterules, NULL);
+        rulestatus = apply_rewrite_list(r, conf->rewriterules, NULL, &lastsub);
         apr_table_setn(r->notes, "mod_rewrite_rewritten",
                        apr_psprintf(r->pool,"%d",rulestatus));
     }
@@ -4692,8 +4886,25 @@ static int hook_uri2file(request_rec *r)
     }
 
     if (rulestatus) {
-        unsigned skip;
-        apr_size_t flen;
+        apr_size_t flen =  r->filename ? strlen(r->filename) : 0;
+        unsigned skip_absolute = flen ? is_absolute_uri(r->filename, NULL) : 0;
+        int to_proxyreq = (flen > 6 && strncmp(r->filename, "proxy:", 6) == 0);
+        int will_escape = skip_absolute && (rulestatus != ACTION_NOESCAPE);
+
+        if (r->args
+                && !will_escape
+                && *(ap_scan_vchar_obstext(r->args))) {
+            /*
+             * We have a raw control character or a ' ' in r->args.
+             * Correct encoding was missed.
+             * Correct encoding was missed and we're not going to escape
+             * it before returning.
+             */
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(10410)
+                          "Rewritten query string contains control "
+                          "characters or spaces");
+            return HTTP_FORBIDDEN;
+        }
 
         if (ACTION_STATUS == rulestatus) {
             int n = r->status;
@@ -4701,9 +4912,11 @@ static int hook_uri2file(request_rec *r)
             r->status = HTTP_OK;
             return n;
         }
+        else if (ACTION_STATUS_SET == rulestatus) {
+            return r->status;
+        }
 
-        flen = r->filename ? strlen(r->filename) : 0;
-        if (flen > 6 && strncmp(r->filename, "proxy:", 6) == 0) {
+        if (to_proxyreq) {
             /* it should be go on as an internal proxy request */
 
             /* check if the proxy module is enabled, so
@@ -4745,7 +4958,7 @@ static int hook_uri2file(request_rec *r)
                         r->filename));
             return OK;
         }
-        else if ((skip = is_absolute_uri(r->filename, NULL)) > 0) {
+        else if (skip_absolute > 0) {
             int n;
 
             /* it was finally rewritten to a remote URL */
@@ -4753,7 +4966,7 @@ static int hook_uri2file(request_rec *r)
             if (rulestatus != ACTION_NOESCAPE) {
                 rewritelog((r, 1, NULL, "escaping %s for redirect",
                             r->filename));
-                r->filename = escape_absolute_uri(r->pool, r->filename, skip);
+                r->filename = escape_absolute_uri(r->pool, r->filename, skip_absolute);
             }
 
             /* append the QUERY_STRING part */
@@ -4821,23 +5034,29 @@ static int hook_uri2file(request_rec *r)
                 return HTTP_BAD_REQUEST;
             }
 
-            /* if there is no valid prefix, we call
-             * the translator from the core and
-             * prefix the filename with document_root
+            /* We have r->filename as a path in a server-context rewrite without
+             * the PT flag. The historical behavior is to treat it as a verbatim
+             * filesystem path iff the first component of the path exists and is
+             * readable by httpd. Otherwise, it is interpreted as DocumentRoot
+             * relative.
              *
              * NOTICE:
              * We cannot leave out the prefix_stat because
-             * - when we always prefix with document_root
-             *   then no absolute path can be created, e.g. via
-             *   emulating a ScriptAlias directive, etc.
-             * - when we always NOT prefix with document_root
+             * - If we always prefix with document_root
+             *   then no absolute path can could ever be used in
+             *   a substitution. e.g. emulating an Alias.
+             * - If we never prefix with document_root
              *   then the files under document_root have to
              *   be references directly and document_root
              *   gets never used and will be a dummy parameter -
-             *   this is also bad
+             *   this is also bad.
+             *   - Later addition: This part is questionable.
+             *     If we had never prefixed, users would just 
+             *     need %{DOCUMENT_ROOT} in substitutions or the 
+             *     [PT] flag.
              *
              * BUT:
-             * Under real Unix systems this is no problem,
+             * Under real Unix systems this is no perf problem,
              * because we only do stat() on the first directory
              * and this gets cached by the kernel for along time!
              */
@@ -4846,7 +5065,9 @@ static int hook_uri2file(request_rec *r)
                 uri_reduced = apr_table_get(r->notes, "mod_rewrite_uri_reduced");
             }
 
-            if (!prefix_stat(r->filename, r->pool) || uri_reduced != NULL) {
+            if (!prefix_stat(r, r->filename, r->pool,
+                             conf->options & OPTION_UNSAFE_PREFIX_STAT ? NULL : lastsub)
+                || uri_reduced != NULL) {
                 int res;
                 char *tmp = r->uri;
 
@@ -4891,6 +5112,7 @@ static int hook_fixup(request_rec *r)
     char *ofilename, *oargs;
     int is_proxyreq;
     void *skipdata;
+    rewriterule_entry *lastsub;
 
     dconf = (rewrite_perdir_conf *)ap_get_module_config(r->per_dir_config,
                                                         &rewrite_module);
@@ -4975,9 +5197,28 @@ static int hook_fixup(request_rec *r)
     /*
      *  now apply the rules ...
      */
-    rulestatus = apply_rewrite_list(r, dconf->rewriterules, dconf->directory);
+    rulestatus = apply_rewrite_list(r, dconf->rewriterules, dconf->directory, &lastsub);
     if (rulestatus) {
-        unsigned skip;
+        unsigned skip_absolute = is_absolute_uri(r->filename, NULL);
+        int to_proxyreq = 0;
+        int will_escape = 0;
+
+        l = strlen(r->filename);
+        to_proxyreq = l > 6 && strncmp(r->filename, "proxy:", 6) == 0;
+        will_escape = skip_absolute && (rulestatus != ACTION_NOESCAPE);
+
+        if (r->args
+               && !will_escape
+               &&  *(ap_scan_vchar_obstext(r->args))) {
+            /*
+             * We have a raw control character or a ' ' in r->args.
+             * Correct encoding was missed.
+             */
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(10411)
+                          "Rewritten query string contains control "
+                          "characters or spaces");
+            return HTTP_FORBIDDEN;
+        }
 
         if (ACTION_STATUS == rulestatus) {
             int n = r->status;
@@ -4985,9 +5226,11 @@ static int hook_fixup(request_rec *r)
             r->status = HTTP_OK;
             return n;
         }
+        else if (ACTION_STATUS_SET == rulestatus) {
+            return r->status;
+        }
 
-        l = strlen(r->filename);
-        if (l > 6 && strncmp(r->filename, "proxy:", 6) == 0) {
+        if (to_proxyreq) {
             /* it should go on as an internal proxy request */
 
             /* make sure the QUERY_STRING and
@@ -5011,7 +5254,7 @@ static int hook_fixup(request_rec *r)
                         "%s [OK]", r->filename));
             return OK;
         }
-        else if ((skip = is_absolute_uri(r->filename, NULL)) > 0) {
+        else if (skip_absolute > 0) {
             /* it was finally rewritten to a remote URL */
 
             /* because we are in a per-dir context
@@ -5020,7 +5263,7 @@ static int hook_fixup(request_rec *r)
              */
             if (dconf->baseurl != NULL) {
                 /* skip 'scheme://' */
-                cp = r->filename + skip;
+                cp = r->filename + skip_absolute;
 
                 if ((cp = ap_strchr(cp, '/')) != NULL && *(++cp)) {
                     rewritelog((r, 2, dconf->directory,
@@ -5065,7 +5308,7 @@ static int hook_fixup(request_rec *r)
             if (rulestatus != ACTION_NOESCAPE) {
                 rewritelog((r, 1, dconf->directory, "escaping %s for redirect",
                             r->filename));
-                r->filename = escape_absolute_uri(r->pool, r->filename, skip);
+                r->filename = escape_absolute_uri(r->pool, r->filename, skip_absolute);
             }
 
             /* append the QUERY_STRING part */
@@ -5225,7 +5468,7 @@ static int hook_mimetype(request_rec *r)
         rewritelog((r, 1, NULL, "force filename %s to have MIME-type '%s'",
                     r->filename, t));
 
-        ap_set_content_type(r, t);
+        ap_set_content_type_ex(r, t, 1);
     }
 
     /* handler */

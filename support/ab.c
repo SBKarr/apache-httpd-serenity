@@ -18,7 +18,7 @@
    ** This program is based on ZeusBench V1.0 written by Adam Twiss
    ** which is Copyright (c) 1996 by Zeus Technology Ltd. http://www.zeustech.net/
    **
-   ** This software is provided "as is" and any express or implied waranties,
+   ** This software is provided "as is" and any express or implied warranties,
    ** including but not limited to, the implied warranties of merchantability and
    ** fitness for a particular purpose are disclaimed.  In no event shall
    ** Zeus Technology Ltd. be liable for any direct, indirect, incidental, special,
@@ -156,16 +156,30 @@
 #include "ap_config_auto.h"
 #endif
 
+#include <math.h>
+#if APR_HAVE_CTYPE_H
+#include <ctype.h>
+#endif
+#if APR_HAVE_LIMITS_H
+#include <limits.h>
+#endif
+
 #if defined(HAVE_OPENSSL)
 
-#include <openssl/rsa.h>
+#include <openssl/evp.h>
 #include <openssl/crypto.h>
 #include <openssl/x509.h>
 #include <openssl/pem.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/rand.h>
+#include <openssl/opensslv.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#include <openssl/core_names.h>
+#endif
+
 #define USE_SSL
+
 #define SK_NUM(x) sk_X509_num(x)
 #define SK_VALUE(x,y) sk_X509_value(x,y)
 typedef STACK_OF(X509) X509_STACK_TYPE;
@@ -178,9 +192,6 @@ typedef STACK_OF(X509) X509_STACK_TYPE;
 #include <openssl/applink.c>
 #endif
 
-#endif
-
-#if defined(USE_SSL)
 #if (OPENSSL_VERSION_NUMBER >= 0x00909000)
 #define AB_SSL_METHOD_CONST const
 #else
@@ -197,6 +208,7 @@ typedef STACK_OF(X509) X509_STACK_TYPE;
 #if !defined(OPENSSL_NO_TLSEXT) && defined(SSL_set_tlsext_host_name)
 #define HAVE_TLSEXT
 #endif
+
 #if defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER < 0x2060000f
 #define SSL_CTRL_SET_MIN_PROTO_VERSION 123
 #define SSL_CTRL_SET_MAX_PROTO_VERSION 124
@@ -205,15 +217,21 @@ typedef STACK_OF(X509) X509_STACK_TYPE;
 #define SSL_CTX_set_max_proto_version(ctx, version) \
    SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MAX_PROTO_VERSION, version, NULL)
 #endif
-#endif
 
-#include <math.h>
-#if APR_HAVE_CTYPE_H
-#include <ctype.h>
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+#ifdef TLS1_3_VERSION
+#define MAX_SSL_PROTO TLS1_3_VERSION
+#else
+#define MAX_SSL_PROTO TLS1_2_VERSION
 #endif
-#if APR_HAVE_LIMITS_H
-#include <limits.h>
+#ifndef OPENSSL_NO_SSL3
+#define MIN_SSL_PROTO SSL3_VERSION
+#else
+#define MIN_SSL_PROTO TLS1_VERSION
 #endif
+#endif /* OPENSSL_VERSION_NUMBER >= 0x10100000L */
+
+#endif /* HAVE_OPENSSL */
 
 /* ------------------- DEFINITIONS -------------------------- */
 
@@ -542,22 +560,33 @@ static void set_conn_state(struct connection *c, connect_state_e new_state)
  *
  */
 #ifdef USE_SSL
-static long ssl_print_cb(BIO *bio,int cmd,const char *argp,int argi,long argl,long ret)
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+static long ssl_print_cb(BIO *bio, int cmd, const char *argp,
+                         size_t len, int argi, long argl, int ret,
+                         size_t *processed)
+#else
+static long ssl_print_cb(BIO *bio, int cmd, const char *argp,
+                         int argi, long argl, long ret)
+#endif
 {
     BIO *out;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    (void)len;
+    (void)processed;
+#endif
 
     out=(BIO *)BIO_get_callback_arg(bio);
     if (out == NULL) return(ret);
 
     if (cmd == (BIO_CB_READ|BIO_CB_RETURN)) {
         BIO_printf(out,"read from %p [%p] (%d bytes => %ld (0x%lX))\n",
-                   bio, argp, argi, ret, ret);
+                   bio, argp, argi, (long)ret, (long)ret);
         BIO_dump(out,(char *)argp,(int)ret);
         return(ret);
     }
     else if (cmd == (BIO_CB_WRITE|BIO_CB_RETURN)) {
         BIO_printf(out,"write to %p [%p] (%d bytes => %ld (0x%lX))\n",
-                   bio, argp, argi, ret, ret);
+                   bio, argp, argi, (long)ret, (long)ret);
         BIO_dump(out,(char *)argp,(int)ret);
     }
     return ret;
@@ -752,17 +781,29 @@ static void ssl_proceed_handshake(struct connection *c)
                         break;
 #ifndef OPENSSL_NO_EC
                     case EVP_PKEY_EC: {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+                        size_t len;
+                        char cname[80];
+                        if (!EVP_PKEY_get_utf8_string_param(key, OSSL_PKEY_PARAM_GROUP_NAME,
+                                                            cname, sizeof(cname), &len)) {
+                            cname[0] = '?';
+                            len = 1;
+                        }
+                        cname[len] = '\0';
+#else
                         const char *cname = NULL;
                         EC_KEY *ec = EVP_PKEY_get1_EC_KEY(key);
                         int nid = EC_GROUP_get_curve_name(EC_KEY_get0_group(ec));
                         EC_KEY_free(ec);
                         cname = EC_curve_nid2nist(nid);
-                        if (!cname)
+                        if (!cname) {
                             cname = OBJ_nid2sn(nid);
-
+                            if (!cname)
+                                cname = "?";
+                        }
+#endif
                         apr_snprintf(ssl_tmp_key, 128, "ECDH %s %d bits",
-                                     cname,
-                                     EVP_PKEY_bits(key));
+                                     cname, EVP_PKEY_bits(key));
                         break;
                         }
 #endif
@@ -1415,7 +1456,11 @@ static void start_connect(struct connection * c)
         SSL_set_bio(c->ssl, bio, bio);
         SSL_set_connect_state(c->ssl);
         if (verbosity >= 4) {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+            BIO_set_callback_ex(bio, ssl_print_cb);
+#else
             BIO_set_callback(bio, ssl_print_cb);
+#endif
             BIO_set_callback_arg(bio, (void *)bio_err);
         }
 #ifdef HAVE_TLSEXT
@@ -1812,11 +1857,11 @@ static void test(void)
 
     if (!use_html) {
         printf("Benchmarking %s ", hostname);
-    if (isproxy)
-        printf("[through %s:%d] ", proxyhost, proxyport);
-    printf("(be patient)%s",
-           (heartbeatres ? "\n" : "..."));
-    fflush(stdout);
+        if (isproxy)
+            printf("[through %s:%d] ", proxyhost, proxyport);
+        printf("(be patient)%s",
+               (heartbeatres ? "\n" : "..."));
+        fflush(stdout);
     }
 
     con = xcalloc(concurrency, sizeof(struct connection));
@@ -2082,14 +2127,14 @@ static void test(void)
 static void copyright(void)
 {
     if (!use_html) {
-        printf("This is ApacheBench, Version %s\n", AP_AB_BASEREVISION " <$Revision: 1874286 $>");
+        printf("This is ApacheBench, Version %s\n", AP_AB_BASEREVISION " <$Revision: 1913912 $>");
         printf("Copyright 1996 Adam Twiss, Zeus Technology Ltd, http://www.zeustech.net/\n");
         printf("Licensed to The Apache Software Foundation, http://www.apache.org/\n");
         printf("\n");
     }
     else {
         printf("<p>\n");
-        printf(" This is ApacheBench, Version %s <i>&lt;%s&gt;</i><br>\n", AP_AB_BASEREVISION, "$Revision: 1874286 $");
+        printf(" This is ApacheBench, Version %s <i>&lt;%s&gt;</i><br>\n", AP_AB_BASEREVISION, "$Revision: 1913912 $");
         printf(" Copyright 1996 Adam Twiss, Zeus Technology Ltd, http://www.zeustech.net/<br>\n");
         printf(" Licensed to The Apache Software Foundation, http://www.apache.org/<br>\n");
         printf("</p>\n<p>\n");
@@ -2160,7 +2205,13 @@ static void usage(const char *progname)
 #endif
 
 #ifdef HAVE_TLSV1_X
+
+#ifdef TLS1_3_VERSION
+#define TLS1_X_HELP_MSG ", TLS1.1, TLS1.2, TLS1.3"
+#else
 #define TLS1_X_HELP_MSG ", TLS1.1, TLS1.2"
+#endif
+
 #else
 #define TLS1_X_HELP_MSG ""
 #endif
@@ -2287,23 +2338,18 @@ static apr_status_t open_postfile(const char *pfile)
 /* sort out command-line args and call test */
 int main(int argc, const char * const argv[])
 {
-    int l;
     char tmp[1024];
     apr_status_t status;
     apr_getopt_t *opt;
     const char *opt_arg;
     char c;
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L
-    int max_prot = TLS1_2_VERSION;
-#ifndef OPENSSL_NO_SSL3
-    int min_prot = SSL3_VERSION;
-#else
-    int min_prot = TLS1_VERSION;
-#endif
-#endif /* #if OPENSSL_VERSION_NUMBER >= 0x10100000L */
 #ifdef USE_SSL
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+    int max_prot = MAX_SSL_PROTO;
+    int min_prot = MIN_SSL_PROTO;
+#endif /* #if OPENSSL_VERSION_NUMBER >= 0x10100000L */
     AB_SSL_METHOD_CONST SSL_METHOD *meth = SSLv23_client_method();
-#endif
+#endif /* USE_SSL */
 
     /* table defaults  */
     tablestring = "";
@@ -2432,8 +2478,7 @@ int main(int argc, const char * const argv[])
                 if (apr_base64_encode_len(strlen(opt_arg)) > sizeof(tmp)) {
                     err("Authentication credentials too long\n");
                 }
-                l = apr_base64_encode(tmp, opt_arg, strlen(opt_arg));
-                tmp[l] = '\0';
+                apr_base64_encode(tmp, opt_arg, strlen(opt_arg));
 
                 auth = apr_pstrcat(cntxt, auth, "Authorization: Basic ", tmp,
                                        "\r\n", NULL);
@@ -2447,8 +2492,7 @@ int main(int argc, const char * const argv[])
                 if (apr_base64_encode_len(strlen(opt_arg)) > sizeof(tmp)) {
                     err("Proxy credentials too long\n");
                 }
-                l = apr_base64_encode(tmp, opt_arg, strlen(opt_arg));
-                tmp[l] = '\0';
+                apr_base64_encode(tmp, opt_arg, strlen(opt_arg));
 
                 auth = apr_pstrcat(cntxt, auth, "Proxy-Authorization: Basic ",
                                        tmp, "\r\n", NULL);
@@ -2559,12 +2603,8 @@ int main(int argc, const char * const argv[])
 #else /* #if OPENSSL_VERSION_NUMBER < 0x10100000L */
                 meth = TLS_client_method();
                 if (strncasecmp(opt_arg, "ALL", 3) == 0) {
-                    max_prot = TLS1_2_VERSION;
-#ifndef OPENSSL_NO_SSL3
-                    min_prot = SSL3_VERSION;
-#else
-                    min_prot = TLS1_VERSION;
-#endif
+                    max_prot = MAX_SSL_PROTO;
+                    min_prot = MIN_SSL_PROTO;
 #ifndef OPENSSL_NO_SSL3
                 } else if (strncasecmp(opt_arg, "SSL3", 4) == 0) {
                     max_prot = SSL3_VERSION;
@@ -2576,6 +2616,11 @@ int main(int argc, const char * const argv[])
                 } else if (strncasecmp(opt_arg, "TLS1.2", 6) == 0) {
                     max_prot = TLS1_2_VERSION;
                     min_prot = TLS1_2_VERSION;
+#ifdef TLS1_3_VERSION
+                } else if (strncasecmp(opt_arg, "TLS1.3", 6) == 0) {
+                    max_prot = TLS1_3_VERSION;
+                    min_prot = TLS1_3_VERSION;
+#endif
                 } else if (strncasecmp(opt_arg, "TLS1", 4) == 0) {
                     max_prot = TLS1_VERSION;
                     min_prot = TLS1_VERSION;
@@ -2587,7 +2632,7 @@ int main(int argc, const char * const argv[])
                 tls_use_sni = 0;
                 break;
 #endif
-#endif
+#endif /* USE_SSL */
         }
     }
 
@@ -2653,13 +2698,23 @@ int main(int argc, const char * const argv[])
     /* Keep memory usage as low as possible */
     SSL_CTX_set_mode (ssl_ctx, SSL_MODE_RELEASE_BUFFERS);
 #endif
+
     if (ssl_cipher != NULL) {
-        if (!SSL_CTX_set_cipher_list(ssl_ctx, ssl_cipher)) {
-            fprintf(stderr, "error setting cipher list [%s]\n", ssl_cipher);
-        ERR_print_errors_fp(stderr);
-        exit(1);
+        int ok;
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L && defined(TLS1_3_VERSION)
+        if (min_prot >= TLS1_3_VERSION)
+            ok = SSL_CTX_set_ciphersuites(ssl_ctx, ssl_cipher);
+        else
+#endif
+        ok = SSL_CTX_set_cipher_list(ssl_ctx, ssl_cipher);
+        if (!ok) {
+            BIO_printf(bio_err, "error setting ciphersuite list [%s]\n",
+                       ssl_cipher);
+            ERR_print_errors(bio_err);
+            exit(1);
+        }
     }
-    }
+
     if (verbosity >= 3) {
         SSL_CTX_set_info_callback(ssl_ctx, ssl_state_cb);
     }

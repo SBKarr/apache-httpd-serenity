@@ -23,6 +23,7 @@
 #include "http_core.h"
 #include "http_protocol.h"
 #include "http_request.h"
+#include "http_ssl.h"
 #include "ap_provider.h"
 #include "util_expr_private.h"
 #include "util_md5.h"
@@ -31,6 +32,10 @@
 #include "apr_fnmatch.h"
 #include "apr_base64.h"
 #include "apr_sha1.h"
+#include "apr_version.h"
+#if APR_VERSION_AT_LEAST(1,5,0)
+#include "apr_escape.h"
+#endif
 
 #include <limits.h>     /* for INT_MAX */
 
@@ -317,7 +322,7 @@ static int ap_expr_eval_comp(ap_expr_eval_ctx_t *ctx, const ap_expr_t *node)
 /* combined string/int comparison for compatibility with ssl_expr */
 static int strcmplex(const char *str1, const char *str2)
 {
-    int i, n1, n2;
+    apr_size_t i, n1, n2;
 
     if (str1 == NULL)
         return -1;
@@ -1075,7 +1080,7 @@ static const char *sha1_func(ap_expr_eval_ctx_t *ctx, const void *data,
     out = apr_palloc(ctx->p, APR_SHA1_DIGESTSIZE*2+1);
 
     apr_sha1_init(&context);
-    apr_sha1_update(&context, arg, strlen(arg));
+    apr_sha1_update(&context, arg, (unsigned int)strlen(arg));
     apr_sha1_final(sha1, &context);
 
     ap_bin2hex(sha1, APR_SHA1_DIGESTSIZE, out);
@@ -1086,9 +1091,16 @@ static const char *sha1_func(ap_expr_eval_ctx_t *ctx, const void *data,
 static const char *md5_func(ap_expr_eval_ctx_t *ctx, const void *data,
                                const char *arg)
 {
-	return ap_md5(ctx->p, (const unsigned char *)arg);
+    return ap_md5(ctx->p, (const unsigned char *)arg);
 }
 
+#if APR_VERSION_AT_LEAST(1,6,0)
+static const char *ldap_func(ap_expr_eval_ctx_t *ctx, const void *data,
+                               const char *arg)
+{
+    return apr_pescape_ldap(ctx->p, arg, APR_ESCAPE_STRING, APR_ESCAPE_LDAP_ALL);
+}
+#endif
 
 #define MAX_FILE_SIZE 10*1024*1024
 static const char *file_func(ap_expr_eval_ctx_t *ctx, const void *data,
@@ -1256,13 +1268,10 @@ static int op_file_subr(ap_expr_eval_ctx_t *ctx, const void *data, const char *a
 }
 
 
-APR_DECLARE_OPTIONAL_FN(int, ssl_is_https, (conn_rec *));
-static APR_OPTIONAL_FN_TYPE(ssl_is_https) *is_https = NULL;
-
 APR_DECLARE_OPTIONAL_FN(int, http2_is_h2, (conn_rec *));
 static APR_OPTIONAL_FN_TYPE(http2_is_h2) *is_http2 = NULL;
 
-static const char *conn_var_names[] = {
+static const char *const conn_var_names[] = {
     "HTTPS",                    /*  0 */
     "IPV6",                     /*  1 */
     "CONN_LOG_ID",              /*  2 */
@@ -1280,7 +1289,7 @@ static const char *conn_var_fn(ap_expr_eval_ctx_t *ctx, const void *data)
 
     switch (index) {
     case 0:
-        if (is_https && is_https(c))
+        if (ap_ssl_conn_is_ssl(c))
             return "on";
         else
             return "off";
@@ -1312,7 +1321,7 @@ static const char *conn_var_fn(ap_expr_eval_ctx_t *ctx, const void *data)
     }
 }
 
-static const char *request_var_names[] = {
+static const char *const request_var_names[] = {
     "REQUEST_METHOD",           /*  0 */
     "REQUEST_SCHEME",           /*  1 */
     "REQUEST_URI",              /*  2 */
@@ -1440,7 +1449,7 @@ static const char *request_var_fn(ap_expr_eval_ctx_t *ctx, const void *data)
     }
 }
 
-static const char *req_header_var_names[] = {
+static const char *const req_header_var_names[] = {
     "HTTP_USER_AGENT",       /* 0 */
     "HTTP_PROXY_CONNECTION", /* 1 */
     "HTTP_REFERER",          /* 2 */
@@ -1451,7 +1460,7 @@ static const char *req_header_var_names[] = {
     NULL
 };
 
-static const char *req_header_header_names[] = {
+static const char *const req_header_header_names[] = {
     "User-Agent",
     "Proxy-Connection",
     "Referer",
@@ -1463,7 +1472,7 @@ static const char *req_header_header_names[] = {
 
 static const char *req_header_var_fn(ap_expr_eval_ctx_t *ctx, const void *data)
 {
-    const char **varname = (const char **)data;
+    const char **const varname = (const char **)data;
     int index = (varname - req_header_var_names);
     const char *name;
 
@@ -1481,7 +1490,7 @@ static const char *req_header_var_fn(ap_expr_eval_ctx_t *ctx, const void *data)
     return apr_table_get(ctx->r->headers_in, name);
 }
 
-static const char *misc_var_names[] = {
+static const char *const misc_var_names[] = {
     "TIME_YEAR",        /* 0 */
     "TIME_MON",         /* 1 */
     "TIME_DAY",         /* 2 */
@@ -1638,7 +1647,7 @@ struct expr_provider_single {
 
 struct expr_provider_multi {
     const void *func;
-    const char **names;
+    const char *const *names;
 };
 
 static const struct expr_provider_multi var_providers[] = {
@@ -1669,6 +1678,9 @@ static const struct expr_provider_single string_func_providers[] = {
     { unbase64_func,        "unbase64",       NULL, 0 },
     { sha1_func,            "sha1",           NULL, 0 },
     { md5_func,             "md5",            NULL, 0 },
+#if APR_VERSION_AT_LEAST(1,6,0)
+    { ldap_func,            "ldap",           NULL, 0 },
+#endif
     { NULL, NULL, NULL}
 };
 
@@ -1704,9 +1716,9 @@ static int core_expr_lookup(ap_expr_lookup_parms *parms)
     case AP_EXPR_FUNC_VAR: {
             const struct expr_provider_multi *prov = var_providers;
             while (prov->func) {
-                const char **name = prov->names;
+                const char *const *name = prov->names;
                 while (*name) {
-                    if (strcasecmp(*name, parms->name) == 0) {
+                    if (ap_cstr_casecmp(*name, parms->name) == 0) {
                         *parms->func = prov->func;
                         *parms->data = name;
                         return OK;
@@ -1739,7 +1751,7 @@ static int core_expr_lookup(ap_expr_lookup_parms *parms)
                 if (parms->type == AP_EXPR_FUNC_OP_UNARY)
                     match = !strcmp(prov->name, parms->name);
                 else
-                    match = !strcasecmp(prov->name, parms->name);
+                    match = !ap_cstr_casecmp(prov->name, parms->name);
                 if (match) {
                     if ((parms->flags & AP_EXPR_FLAG_RESTRICTED)
                         && prov->restricted) {
@@ -1806,10 +1818,7 @@ static int expr_lookup_not_found(ap_expr_lookup_parms *parms)
 static int ap_expr_post_config(apr_pool_t *pconf, apr_pool_t *plog,
                                apr_pool_t *ptemp, server_rec *s)
 {
-    is_https = APR_RETRIEVE_OPTIONAL_FN(ssl_is_https);
     is_http2 = APR_RETRIEVE_OPTIONAL_FN(http2_is_h2);
-    apr_pool_cleanup_register(pconf, &is_https, ap_pool_cleanup_set_null,
-                              apr_pool_cleanup_null);
     return OK;
 }
 

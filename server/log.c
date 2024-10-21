@@ -55,7 +55,7 @@
 #include "ap_mpm.h"
 #include "ap_listen.h"
 
-#if HAVE_GETTID
+#ifdef HAVE_SYS_GETTID
 #include <sys/syscall.h>
 #include <sys/types.h>
 #endif
@@ -63,6 +63,10 @@
 /* we know core's module_index is 0 */
 #undef APLOG_MODULE_INDEX
 #define APLOG_MODULE_INDEX AP_CORE_MODULE_INDEX
+
+#ifndef DEFAULT_LOG_TID
+#define DEFAULT_LOG_TID NULL
+#endif
 
 typedef struct {
     const char *t_name;
@@ -627,14 +631,18 @@ static int log_tid(const ap_errorlog_info *info, const char *arg,
 #if APR_HAS_THREADS
     int result;
 #endif
-#if HAVE_GETTID
+#if defined(HAVE_GETTID) || defined(HAVE_SYS_GETTID)
     if (arg && *arg == 'g') {
+#ifdef HAVE_GETTID
+        pid_t tid = gettid();
+#else
         pid_t tid = syscall(SYS_gettid);
+#endif
         if (tid == -1)
             return 0;
         return apr_snprintf(buf, buflen, "%"APR_PID_T_FMT, tid);
     }
-#endif
+#endif /* HAVE_GETTID || HAVE_SYS_GETTID */
 #if APR_HAS_THREADS
     if (ap_mpm_query(AP_MPMQ_IS_THREADED, &result) == APR_SUCCESS
         && result != AP_MPMQ_NOT_SUPPORTED)
@@ -652,14 +660,32 @@ static int log_ctime(const ap_errorlog_info *info, const char *arg,
     int time_len = buflen;
     int option = AP_CTIME_OPTION_NONE;
 
-    while (arg && *arg) {
-        switch (*arg) {
-            case 'u':   option |= AP_CTIME_OPTION_USEC;
-                        break;
-            case 'c':   option |= AP_CTIME_OPTION_COMPACT;
-                        break;
+    if (arg) {
+        if (arg[0] == 'u' && !arg[1]) { /* no ErrorLogFormat (fast path) */
+            option |= AP_CTIME_OPTION_USEC;
         }
-        arg++;
+        else if (!ap_strchr_c(arg, '%')) { /* special "%{cuz}t" formats */
+            while (*arg) {
+                switch (*arg++) {
+                case 'u':
+                    option |= AP_CTIME_OPTION_USEC;
+                    break;
+                case 'c':
+                    option |= AP_CTIME_OPTION_COMPACT;
+                    break;
+                case 'z':
+                    option |= AP_CTIME_OPTION_GMTOFF;
+                    break;
+                }
+            }
+        }
+        else { /* "%{strftime %-format}t" */
+            apr_size_t len = 0;
+            apr_time_exp_t expt;
+            ap_explode_recent_localtime(&expt, apr_time_now());
+            apr_strftime(buf, &len, buflen, arg, &expt);
+            return (int)len;
+        }
     }
 
     ap_recent_ctime_ex(buf, apr_time_now(), option, &time_len);
@@ -968,7 +994,7 @@ static int do_errorlog_default(const ap_errorlog_info *info, char *buf,
 #if APR_HAS_THREADS
         field_start = len;
         len += cpystrn(buf + len, ":tid ", buflen - len);
-        item_len = log_tid(info, NULL, buf + len, buflen - len);
+        item_len = log_tid(info, DEFAULT_LOG_TID, buf + len, buflen - len);
         if (!item_len)
             len = field_start;
         else
@@ -1166,6 +1192,11 @@ static void log_error_core(const char *file, int line, int module_index,
 #endif
 
         logf = stderr_log;
+
+        /* Use the main ErrorLogFormat if any */
+        if (ap_server_conf) {
+            sconf = ap_get_core_module_config(ap_server_conf->module_config);
+        }
     }
     else {
         int configured_level = r ? ap_get_request_module_loglevel(r, module_index)        :
@@ -1218,6 +1249,10 @@ static void log_error_core(const char *file, int line, int module_index,
                     add_log_id(c, rmain);
                 }
             }
+        }
+        else if (ap_server_conf) {
+            /* Use the main ErrorLogFormat if any */
+            sconf = ap_get_core_module_config(ap_server_conf->module_config);
         }
     }
 
@@ -1600,6 +1635,9 @@ AP_DECLARE(void) ap_log_pid(apr_pool_t *p, const char *filename)
     pid_t mypid;
     apr_status_t rv;
     const char *fname;
+    char *temp_fname;
+    apr_fileperms_t perms;
+    char pidstr[64];
 
     if (!filename) {
         return;
@@ -1628,19 +1666,31 @@ AP_DECLARE(void) ap_log_pid(apr_pool_t *p, const char *filename)
                       fname);
     }
 
-    if ((rv = apr_file_open(&pid_file, fname,
-                            APR_WRITE | APR_CREATE | APR_TRUNCATE,
-                            APR_UREAD | APR_UWRITE | APR_GREAD | APR_WREAD, p))
-        != APR_SUCCESS) {
+    temp_fname = apr_pstrcat(p, fname, ".XXXXXX", NULL);
+    rv = apr_file_mktemp(&pid_file, temp_fname,
+                         APR_FOPEN_WRITE | APR_FOPEN_CREATE | APR_FOPEN_TRUNCATE, p);
+    if (rv != APR_SUCCESS) {
         ap_log_error(APLOG_MARK, APLOG_ERR, rv, NULL, APLOGNO(00099)
-                     "could not create %s", fname);
+                     "could not create %s", temp_fname);
         ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL, APLOGNO(00100)
                      "%s: could not log pid to file %s",
                      ap_server_argv0, fname);
         exit(1);
     }
-    apr_file_printf(pid_file, "%" APR_PID_T_FMT APR_EOL_STR, mypid);
-    apr_file_close(pid_file);
+
+    apr_snprintf(pidstr, sizeof pidstr, "%" APR_PID_T_FMT APR_EOL_STR, mypid);
+
+    perms = APR_UREAD | APR_UWRITE | APR_GREAD | APR_WREAD;
+    if (((rv = apr_file_perms_set(temp_fname, perms)) != APR_SUCCESS && rv != APR_ENOTIMPL)
+        || (rv = apr_file_write_full(pid_file, pidstr, strlen(pidstr), NULL)) != APR_SUCCESS
+        || (rv = apr_file_close(pid_file)) != APR_SUCCESS
+        || (rv = apr_file_rename(temp_fname, fname, p)) != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, rv, NULL, APLOGNO(10231)
+                     "%s: Failed creating pid file %s",
+                     ap_server_argv0, temp_fname);
+        exit(1);
+    }
+
     saved_pid = mypid;
 }
 
@@ -1932,8 +1982,8 @@ AP_DECLARE(void) ap_close_piped_log(piped_log *pl)
 
 AP_DECLARE(const char *) ap_parse_log_level(const char *str, int *val)
 {
-    char *err = "Log level keyword must be one of emerg/alert/crit/error/warn/"
-                "notice/info/debug/trace1/.../trace8";
+    const char *err = "Log level keyword must be one of emerg/alert/crit/error/"
+                      "warn/notice/info/debug/trace1/.../trace8";
     int i = 0;
 
     if (str == NULL)

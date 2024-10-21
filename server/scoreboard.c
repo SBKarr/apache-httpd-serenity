@@ -388,7 +388,7 @@ AP_DECLARE(void) ap_increment_counts(ap_sb_handle_t *sb, request_rec *r)
     if (pfn_ap_logio_get_last_bytes != NULL) {
         bytes = pfn_ap_logio_get_last_bytes(r->connection);
     }
-    else if (r->method_number == M_GET && r->method[0] == 'H') {
+    else if (r->method_number == M_GET && r->method && r->method[0] == 'H') {
         bytes = 0;
     }
     else {
@@ -653,7 +653,7 @@ AP_DECLARE(void) ap_time_process_request(ap_sb_handle_t *sbh, int status)
     }
 }
 
-AP_DECLARE(int) ap_update_global_status()
+AP_DECLARE(int) ap_update_global_status(void)
 {
 #ifdef HAVE_TIMES
     if (ap_scoreboard_image == NULL) {
@@ -707,7 +707,7 @@ AP_DECLARE(process_score *) ap_get_scoreboard_process(int x)
     return &ap_scoreboard_image->parent[x];
 }
 
-AP_DECLARE(global_score *) ap_get_scoreboard_global()
+AP_DECLARE(global_score *) ap_get_scoreboard_global(void)
 {
     return ap_scoreboard_image->global;
 }

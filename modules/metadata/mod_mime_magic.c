@@ -788,7 +788,7 @@ static int magic_rsl_to_request(request_rec *r)
     /* XXX: this could be done at config time I'm sure... but I'm
      * confused by all this magic_rsl stuff. -djg */
     ap_content_type_tolower(tmp);
-    ap_set_content_type(r, tmp);
+    ap_set_content_type_ex(r, tmp, 1);
 
     if (state == rsl_encoding) {
         tmp = rsl_strdup(r, encoding_frag,
@@ -2181,6 +2181,7 @@ static int uncompress(request_rec *r, int method,
      */
     if (apr_pool_create(&sub_context, r->pool) != APR_SUCCESS)
         return -1;
+    apr_pool_tag(sub_context, "magic_uncompress");
 
     if ((rv = create_uncompress_child(&parm, sub_context, &pipe_out)) != APR_SUCCESS) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO(01553)
@@ -2325,7 +2326,7 @@ static int revision_suffix(request_rec *r)
 
     /* extract content type/encoding/language from sub-request */
     if (sub->content_type) {
-        ap_set_content_type(r, apr_pstrdup(r->pool, sub->content_type));
+        ap_set_content_type_ex(r, apr_pstrdup(r->pool, sub->content_type), 1);
 #if MIME_MAGIC_DEBUG
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(01557)
                     MODNAME ": subrequest %s got %s",

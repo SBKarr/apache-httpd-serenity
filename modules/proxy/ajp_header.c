@@ -17,6 +17,8 @@
 #include "ajp_header.h"
 #include "ajp.h"
 
+#include "util_script.h"
+
 APLOG_USE_MODULE(proxy_ajp);
 
 static const char *response_trans_headers[] = {
@@ -584,8 +586,15 @@ static apr_status_t ajp_unmarshal_response(ajp_msg_t *msg,
         r->headers_out = save_table;
     }
     else {
-        r->headers_out = NULL;
+        /*
+         * Reset headers, but not to NULL because things below the chain expect
+         * this to be non NULL e.g. the ap_content_length_filter.
+         */
+        r->headers_out = apr_table_make(r->pool, 1);
         num_headers = 0;
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(10405)
+                "ajp_unmarshal_response: Bad number of headers");
+        return rc;
     }
 
     ap_log_rerror(APLOG_MARK, APLOG_TRACE4, 0, r,
@@ -633,15 +642,15 @@ static apr_status_t ajp_unmarshal_response(ajp_msg_t *msg,
         }
 
         /* Set-Cookie need additional processing */
-        if (!strcasecmp(stringname, "Set-Cookie")) {
+        if (!ap_cstr_casecmp(stringname, "Set-Cookie")) {
             value = ap_proxy_cookie_reverse_map(r, dconf, value);
         }
         /* Location, Content-Location, URI and Destination need additional
          * processing */
-        else if (!strcasecmp(stringname, "Location")
-                 || !strcasecmp(stringname, "Content-Location")
-                 || !strcasecmp(stringname, "URI")
-                 || !strcasecmp(stringname, "Destination"))
+        else if (!ap_cstr_casecmp(stringname, "Location")
+                 || !ap_cstr_casecmp(stringname, "Content-Location")
+                 || !ap_cstr_casecmp(stringname, "URI")
+                 || !ap_cstr_casecmp(stringname, "Destination"))
         {
           value = ap_proxy_location_reverse_map(r, dconf, value);
         }
@@ -654,13 +663,21 @@ static apr_status_t ajp_unmarshal_response(ajp_msg_t *msg,
         apr_table_add(r->headers_out, stringname, value);
 
         /* Content-type needs an additional handling */
-        if (strcasecmp(stringname, "Content-Type") == 0) {
+        if (ap_cstr_casecmp(stringname, "Content-Type") == 0) {
              /* add corresponding filter */
             ap_set_content_type(r, apr_pstrdup(r->pool, value));
             ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
                "ajp_unmarshal_response: ap_set_content_type to '%s'", value);
         }
     }
+
+    /* AJP has its own body framing mechanism which we don't
+     * match against any provided Content-Length, so let the
+     * core determine C-L vs T-E based on what's actually sent.
+     */
+    if (!apr_table_get(r->subprocess_env, AP_TRUST_CGILIKE_CL_ENVVAR))
+        apr_table_unset(r->headers_out, "Content-Length");
+    apr_table_unset(r->headers_out, "Transfer-Encoding");
 
     return APR_SUCCESS;
 }

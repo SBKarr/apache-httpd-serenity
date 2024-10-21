@@ -35,18 +35,49 @@ apr_status_t md_util_pool_vdo(md_util_vaction *cb, void *baton, apr_pool_t *p, .
 /**************************************************************************************************/
 /* data chunks */
 
+typedef void md_data_free_fn(void *data);
+
 typedef struct md_data_t md_data_t;
 struct md_data_t {
     const char *data;
     apr_size_t len;
+    md_data_free_fn *free_data;
 };
 
-#define MD_DATA_CWRAP(d, buffer)       md_data_t d = { buffer, sizeof(buffer) }
+/**
+ * Init the data to empty, overwriting any content.
+ */
+void md_data_null(md_data_t *d);
 
-md_data_t *md_data_make(apr_pool_t *p, apr_size_t len);
-md_data_t *md_data_create(apr_pool_t *p, const char *data, apr_size_t len);
+/**
+ * Create a new md_data_t, providing `len` bytes allocated from pool `p`.
+ */
+md_data_t *md_data_pmake(apr_size_t len, apr_pool_t *p);
+/**
+ * Initialize md_data_t 'd', providing `len` bytes allocated from pool `p`.
+ */
+void md_data_pinit(md_data_t *d, apr_size_t len, apr_pool_t *p);
+/**
+ * Initialize md_data_t 'd', by borrowing 'len' bytes in `data` without copying.
+ * `d` will not take ownership.
+ */
+void md_data_init(md_data_t *d, const char *data, apr_size_t len);
 
-void md_data_assign_pcopy(md_data_t *dest, const md_data_t *src, apr_pool_t *p);
+/**
+ * Initialize md_data_t 'd', by borrowing the NUL-terminated `str`.
+ * `d` will not take ownership.
+ */
+void md_data_init_str(md_data_t *d, const char *str);
+
+/**
+ * Free any present data and clear (NULL) it. Passing NULL is permitted.
+ */
+void md_data_clear(md_data_t *d);
+
+md_data_t *md_data_make_pcopy(apr_pool_t *p, const char *data, apr_size_t len);
+
+apr_status_t md_data_assign_copy(md_data_t *dest, const char *src, apr_size_t src_len);
+void md_data_assign_pcopy(md_data_t *dest, const char *src, apr_size_t src_len, apr_pool_t *p);
 
 apr_status_t md_data_to_hex(const char **phex, char separator,
                             apr_pool_t *p, const md_data_t *data);
@@ -100,6 +131,7 @@ int md_array_str_add_missing(struct apr_array_header_t *dest,
 
 /**************************************************************************************************/
 /* process execution */
+
 apr_status_t md_util_exec(apr_pool_t *p, const char *cmd, const char * const *argv,
                           int *exit_code);
 
@@ -142,6 +174,11 @@ struct apr_array_header_t *md_dns_make_minimal(apr_pool_t *p,
  */
 int md_dns_domains_match(const apr_array_header_t *domains, const char *name);
 
+/**
+ * @return != 0 iff `name` is matched by a wildcard pattern in `domains`
+ */
+int md_is_wild_match(const apr_array_header_t *domains, const char *name);
+
 /**************************************************************************************************/
 /* file system related */
 
@@ -157,6 +194,7 @@ apr_status_t md_util_path_merge(const char **ppath, apr_pool_t *p, ...);
 
 apr_status_t md_util_is_dir(const char *path, apr_pool_t *pool);
 apr_status_t md_util_is_file(const char *path, apr_pool_t *pool);
+apr_status_t md_util_is_unix_socket(const char *path, apr_pool_t *pool);
 int md_file_exists(const char *fname, apr_pool_t *p);
 
 typedef apr_status_t md_util_file_cb(void *baton, struct apr_file_t *f, apr_pool_t *p);
@@ -207,6 +245,7 @@ apr_status_t md_util_abs_http_uri_check(apr_pool_t *p, const char *uri, const ch
 const char *md_link_find_relation(const struct apr_table_t *headers, 
                                   apr_pool_t *pool, const char *relation);
 
+const char *md_util_parse_ct(apr_pool_t *pool, const char *cth);
 /**************************************************************************************************/
 /* retry logic */
 

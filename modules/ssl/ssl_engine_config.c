@@ -27,6 +27,7 @@
                                            damned if you don't.''
                                                -- Unknown        */
 #include "ssl_private.h"
+
 #include "util_mutex.h"
 #include "ap_provider.h"
 
@@ -73,6 +74,13 @@ SSLModConfigRec *ssl_config_global_create(server_rec *s)
     mc->stapling_cache         = NULL;
     mc->stapling_cache_mutex   = NULL;
     mc->stapling_refresh_mutex = NULL;
+#endif
+
+#ifdef HAVE_OPENSSL_KEYLOG
+    mc->keylog_file = NULL;
+#endif
+#ifdef HAVE_FIPS
+    mc->fips = UNSET;
 #endif
 
     apr_pool_userdata_set(mc, SSL_MOD_CONFIG_KEY,
@@ -219,9 +227,6 @@ static SSLSrvConfigRec *ssl_config_server_new(apr_pool_t *p)
     sc->insecure_reneg         = UNSET;
 #ifdef HAVE_TLSEXT
     sc->strict_sni_vhost_check = SSL_ENABLED_UNSET;
-#endif
-#ifdef HAVE_FIPS
-    sc->fips                   = UNSET;
 #endif
 #ifndef OPENSSL_NO_COMP
     sc->compression            = UNSET;
@@ -394,9 +399,6 @@ void *ssl_config_server_merge(apr_pool_t *p, void *basev, void *addv)
     cfgMergeBool(insecure_reneg);
 #ifdef HAVE_TLSEXT
     cfgMerge(strict_sni_vhost_check, SSL_ENABLED_UNSET);
-#endif
-#ifdef HAVE_FIPS
-    cfgMergeBool(fips);
 #endif
 #ifndef OPENSSL_NO_COMP
     cfgMergeBool(compression);
@@ -591,14 +593,15 @@ const char *ssl_cmd_SSLPassPhraseDialog(cmd_parms *cmd,
     return NULL;
 }
 
-#if defined(HAVE_OPENSSL_ENGINE_H) && defined(HAVE_ENGINE_INIT)
 const char *ssl_cmd_SSLCryptoDevice(cmd_parms *cmd,
                                     void *dcfg,
                                     const char *arg)
 {
     SSLModConfigRec *mc = myModConfig(cmd->server);
     const char *err;
+#if MODSSL_HAVE_ENGINE_API
     ENGINE *e;
+#endif
 
     if ((err = ap_check_cmd_context(cmd, GLOBAL_ONLY))) {
         return err;
@@ -607,13 +610,16 @@ const char *ssl_cmd_SSLCryptoDevice(cmd_parms *cmd,
     if (strcEQ(arg, "builtin")) {
         mc->szCryptoDevice = NULL;
     }
+#if MODSSL_HAVE_ENGINE_API
     else if ((e = ENGINE_by_id(arg))) {
         mc->szCryptoDevice = arg;
         ENGINE_free(e);
     }
+#endif
     else {
         err = "SSLCryptoDevice: Invalid argument; must be one of: "
               "'builtin' (none)";
+#if MODSSL_HAVE_ENGINE_API
         e = ENGINE_get_first();
         while (e) {
             err = apr_pstrcat(cmd->pool, err, ", '", ENGINE_get_id(e),
@@ -622,12 +628,12 @@ const char *ssl_cmd_SSLCryptoDevice(cmd_parms *cmd,
              * on the 'old' e, per the docs in engine.h. */
             e = ENGINE_get_next(e);
         }
+#endif
         return err;
     }
 
     return NULL;
 }
-#endif
 
 const char *ssl_cmd_SSLRandomSeed(cmd_parms *cmd,
                                   void *dcfg,
@@ -745,7 +751,7 @@ const char *ssl_cmd_SSLEngine(cmd_parms *cmd, void *dcfg, const char *arg)
 const char *ssl_cmd_SSLFIPS(cmd_parms *cmd, void *dcfg, int flag)
 {
 #ifdef HAVE_FIPS
-    SSLSrvConfigRec *sc = mySrvConfig(cmd->server);
+    SSLModConfigRec *mc = myModConfig(cmd->server);
 #endif
     const char *err;
 
@@ -754,9 +760,9 @@ const char *ssl_cmd_SSLFIPS(cmd_parms *cmd, void *dcfg, int flag)
     }
 
 #ifdef HAVE_FIPS
-    if ((sc->fips != UNSET) && (sc->fips != (BOOL)(flag ? TRUE : FALSE)))
+    if ((mc->fips != UNSET) && (mc->fips != (BOOL)(flag ? TRUE : FALSE)))
         return "Conflicting SSLFIPS options, cannot be both On and Off";
-    sc->fips = flag ? TRUE : FALSE;
+    mc->fips = flag ? TRUE : FALSE;
 #else
     if (flag)
         return "SSLFIPS invalid, rebuild httpd and openssl compiled for FIPS";
@@ -797,7 +803,7 @@ const char *ssl_cmd_SSLCipherSuite(cmd_parms *cmd,
         return NULL;
     }
 #endif
-    return apr_pstrcat(cmd->pool, "procotol '", arg1, "' not supported", NULL);
+    return apr_pstrcat(cmd->pool, "protocol '", arg1, "' not supported", NULL);
 }
 
 #define SSL_FLAGS_CHECK_FILE \
@@ -809,8 +815,14 @@ const char *ssl_cmd_SSLCipherSuite(cmd_parms *cmd,
 static const char *ssl_cmd_check_file(cmd_parms *parms,
                                       const char **file)
 {
-    const char *filepath = ap_server_root_relative(parms->pool, *file);
+    const char *filepath;
 
+    /* If only dumping the config, don't verify the paths */
+    if (ap_state_query(AP_SQ_RUN_MODE) == AP_SQ_RM_CONFIG_DUMP) {
+        return NULL;
+    }
+
+    filepath = ap_server_root_relative(parms->pool, *file);
     if (!filepath) {
         return apr_pstrcat(parms->pool, parms->cmd->name,
                            ": Invalid file path ", *file, NULL);
@@ -849,10 +861,12 @@ const char *ssl_cmd_SSLCompression(cmd_parms *cmd, void *dcfg, int flag)
         }
     }
     sc->compression = flag ? TRUE : FALSE;
-    return NULL;
 #else
-    return "Setting Compression mode unsupported; not implemented by the SSL library";
+    if (flag) {
+        return "Setting Compression mode unsupported; not implemented by the SSL library";
+    }
 #endif
+    return NULL;
 }
 
 const char *ssl_cmd_SSLHonorCipherOrder(cmd_parms *cmd, void *dcfg, int flag)
@@ -1555,7 +1569,7 @@ const char *ssl_cmd_SSLProxyCipherSuite(cmd_parms *cmd,
         return NULL;
     }
 #endif
-    return apr_pstrcat(cmd->pool, "procotol '", arg1, "' not supported", NULL);
+    return apr_pstrcat(cmd->pool, "protocol '", arg1, "' not supported", NULL);
 }
 
 const char *ssl_cmd_SSLProxyVerify(cmd_parms *cmd,

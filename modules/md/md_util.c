@@ -25,6 +25,10 @@
 #include <apr_tables.h>
 #include <apr_uri.h>
 
+#if APR_HAVE_STDLIB_H
+#include <stdlib.h>
+#endif
+
 #include "md.h"
 #include "md_log.h"
 #include "md_util.h"
@@ -37,8 +41,8 @@ apr_status_t md_util_pool_do(md_util_action *cb, void *baton, apr_pool_t *p)
     apr_pool_t *ptemp;
     apr_status_t rv = apr_pool_create(&ptemp, p);
     if (APR_SUCCESS == rv) {
+        apr_pool_tag(ptemp, "md_pool_do");
         rv = cb(baton, p, ptemp);
-        
         apr_pool_destroy(ptemp);
     }
     return rv;
@@ -51,6 +55,7 @@ static apr_status_t pool_vado(md_util_vaction *cb, void *baton, apr_pool_t *p, v
     
     rv = apr_pool_create(&ptemp, p);
     if (APR_SUCCESS == rv) {
+        apr_pool_tag(ptemp, "md_pool_vado");
         rv = cb(baton, p, ptemp, ap);
         apr_pool_destroy(ptemp);
     }
@@ -71,30 +76,75 @@ apr_status_t md_util_pool_vdo(md_util_vaction *cb, void *baton, apr_pool_t *p, .
 /**************************************************************************************************/
 /* data chunks */
 
-md_data_t *md_data_create(apr_pool_t *p, const char *data, apr_size_t len)
+void md_data_pinit(md_data_t *d, apr_size_t len, apr_pool_t *p)
 {
-    md_data_t *d;
-    
-    d = apr_palloc(p, sizeof(*d));
-    d->len = len;
-    d->data = len? apr_pstrndup(p, data, len) : NULL;
-    return d;
-}
-
-md_data_t *md_data_make(apr_pool_t *p, apr_size_t len)
-{
-    md_data_t *d;
-    
-    d = apr_palloc(p, sizeof(*d));
-    d->len = len;
+    md_data_null(d);
     d->data = apr_pcalloc(p, len);
+    d->len = len;
+}
+
+md_data_t *md_data_pmake(apr_size_t len, apr_pool_t *p)
+{
+    md_data_t *d;
+    
+    d = apr_palloc(p, sizeof(*d));
+    md_data_pinit(d, len, p);
     return d;
 }
 
-void md_data_assign_pcopy(md_data_t *dest, const md_data_t *src, apr_pool_t *p)
+void md_data_init(md_data_t *d, const char *data, apr_size_t len)
 {
-    dest->data = (src->data && src->len)? apr_pmemdup(p, src->data, src->len) : NULL;
-    dest->len = dest->data? src->len : 0;
+    md_data_null(d);
+    d->len = len;
+    d->data = data;
+}
+
+void md_data_init_str(md_data_t *d, const char *str)
+{
+    md_data_init(d, str, strlen(str));
+}
+
+void md_data_null(md_data_t *d)
+{
+    memset(d, 0, sizeof(*d));
+}
+
+void md_data_clear(md_data_t *d)
+{
+    if (d) {
+        if (d->data && d->free_data) d->free_data((void*)d->data);
+        memset(d, 0, sizeof(*d));
+    }
+}
+
+md_data_t *md_data_make_pcopy(apr_pool_t *p, const char *data, apr_size_t len)
+{
+    md_data_t *d;
+
+    d = apr_palloc(p, sizeof(*d));
+    d->len = len;
+    d->data = len? apr_pmemdup(p, data, len) : NULL;
+    return d;
+}
+
+apr_status_t md_data_assign_copy(md_data_t *dest, const char *src, apr_size_t src_len)
+{
+    md_data_clear(dest);
+    if (src && src_len) {
+        dest->data = malloc(src_len);
+        if (!dest->data) return APR_ENOMEM;
+        memcpy((void*)dest->data, src, src_len);
+        dest->len = src_len;
+        dest->free_data = free;
+    }
+    return APR_SUCCESS;
+}
+
+void md_data_assign_pcopy(md_data_t *dest, const char *src, apr_size_t src_len, apr_pool_t *p)
+{
+    md_data_clear(dest);
+    dest->data = (src && src_len)? apr_pmemdup(p, src, src_len) : NULL;
+    dest->len = dest->data? src_len : 0;
 }
 
 static const char * const hex_const[] = {
@@ -152,7 +202,7 @@ int md_array_remove_at(struct apr_array_header_t *a, int idx)
     else {
         ps = (a->elts + (idx * a->elt_size));
         pe = ps + a->elt_size;
-        memmove(ps, pe, (a->nelts - (idx+1)) * a->elt_size);
+        memmove(ps, pe, (size_t)((a->nelts - (idx+1)) * a->elt_size));
         --a->nelts;
     }
     return 1;
@@ -222,7 +272,7 @@ int md_array_str_eq(const struct apr_array_header_t *a1,
     const char *s1, *s2;
     
     if (a1 == a2) return 1;
-    if (!a1) return 0;
+    if (!a1 || !a2) return 0;
     if (a1->nelts != a2->nelts) return 0;
     for (i = 0; i < a1->nelts; ++i) {
         s1 = APR_ARRAY_IDX(a1, i, const char *);
@@ -344,6 +394,16 @@ apr_status_t md_util_is_file(const char *path, apr_pool_t *pool)
     apr_status_t rv = apr_stat(&info, path, APR_FINFO_TYPE, pool);
     if (rv == APR_SUCCESS) {
         rv = (info.filetype == APR_REG)? APR_SUCCESS : APR_EINVAL;
+    }
+    return rv;
+}
+
+apr_status_t md_util_is_unix_socket(const char *path, apr_pool_t *pool)
+{
+    apr_finfo_t info;
+    apr_status_t rv = apr_stat(&info, path, APR_FINFO_TYPE, pool);
+    if (rv == APR_SUCCESS) {
+        rv = (info.filetype == APR_SOCK)? APR_SUCCESS : APR_EINVAL;
     }
     return rv;
 }
@@ -856,6 +916,19 @@ int md_dns_domains_match(const apr_array_header_t *domains, const char *name)
     return 0;
 }
 
+int md_is_wild_match(const apr_array_header_t *domains, const char *name)
+{
+    const char *domain;
+    int i;
+
+    for (i = 0; i < domains->nelts; ++i) {
+        domain = APR_ARRAY_IDX(domains, i, const char*);
+        if (md_dns_matches(domain, name))
+            return (domain[0] == '*' && domain[1] == '.');
+    }
+    return 0;
+}
+
 const char *md_util_schemify(apr_pool_t *p, const char *s, const char *def_scheme)
 {
     const char *cp = s;
@@ -1008,8 +1081,8 @@ apr_status_t md_util_try(md_util_try_fn *fn, void *baton, int ignore_errs,
 
 /* execute process ********************************************************************************/
 
-apr_status_t md_util_exec(apr_pool_t *p, const char *cmd, const char * const *argv,
-                          int *exit_code)
+apr_status_t md_util_exec(apr_pool_t *p, const char *cmd,
+                          const char * const *argv, int *exit_code)
 {
     apr_status_t rv;
     apr_procattr_t *procattr;
@@ -1024,7 +1097,7 @@ apr_status_t md_util_exec(apr_pool_t *p, const char *cmd, const char * const *ar
     if (   APR_SUCCESS == (rv = apr_procattr_create(&procattr, p))
         && APR_SUCCESS == (rv = apr_procattr_io_set(procattr, APR_NO_FILE, 
                                                     APR_NO_PIPE, APR_FULL_BLOCK))
-        && APR_SUCCESS == (rv = apr_procattr_cmdtype_set(procattr, APR_PROGRAM))
+        && APR_SUCCESS == (rv = apr_procattr_cmdtype_set(procattr, APR_PROGRAM_ENV))
         && APR_SUCCESS == (rv = apr_proc_create(proc, cmd, argv, NULL, procattr, p))) {
         
         /* read stderr and log on INFO for possible fault analysis. */
@@ -1471,3 +1544,23 @@ const char *md_link_find_relation(const apr_table_t *headers,
     return ctx.url;
 }
 
+const char *md_util_parse_ct(apr_pool_t *pool, const char *cth)
+{
+    char       *type;
+    const char *p;
+    apr_size_t  hlen;
+
+    if (!cth) return NULL;
+
+    for( p = cth; *p && *p != ' ' && *p != ';'; ++p)
+        ;
+    hlen = (apr_size_t)(p - cth);
+    type = apr_pcalloc( pool, hlen + 1 );
+    assert(type);
+    memcpy(type, cth, hlen);
+    type[hlen] = '\0';
+
+    return type;
+    /* Could parse and return parameters here, but we don't need any at present.
+     */
+}

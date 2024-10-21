@@ -176,7 +176,7 @@ static apr_status_t jselect_add(json_t *val, md_json_t *json, va_list ap)
     aj = json_object_get(j, key);
     if (!aj) {
         aj = json_array();
-        json_object_set(j, key, aj);
+        json_object_set_new(j, key, aj);
     }
     
     if (!json_is_array(aj)) {
@@ -202,7 +202,7 @@ static apr_status_t jselect_insert(json_t *val, size_t index, md_json_t *json, v
     aj = json_object_get(j, key);
     if (!aj) {
         aj = json_array();
-        json_object_set(j, key, aj);
+        json_object_set_new(j, key, aj);
     }
     
     if (!json_is_array(aj)) {
@@ -832,6 +832,32 @@ int md_json_itera(md_json_itera_cb *cb, void *baton, md_json_t *json, ...)
     return 1;
 }
 
+int md_json_iterkey(md_json_iterkey_cb *cb, void *baton, md_json_t *json, ...)
+{
+    json_t *j;
+    va_list ap;
+    const char *key;
+    json_t *val;
+    md_json_t wrap;
+    
+    va_start(ap, json);
+    j = jselect(json, ap);
+    va_end(ap);
+    
+    if (!j || !json_is_object(j)) {
+        return 0;
+    }
+        
+    wrap.p = json->p;
+    json_object_foreach(j, key, val) {
+        wrap.j = val;
+        if (!cb(baton, key, &wrap)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /**************************************************************************************************/
 /* array strings */
 
@@ -1101,11 +1127,14 @@ apr_status_t md_json_readb(md_json_t **pjson, apr_pool_t *pool, apr_bucket_briga
     json_t *j;
     
     j = json_load_callback(load_cb, bb, 0, &error);
-    if (!j) {
-        return APR_EINVAL;
+    if (j) {
+        *pjson = json_create(pool, j);
+    } else {
+        md_log_perror(MD_LOG_MARK, MD_LOG_ERR, 0, pool,
+                      "failed to load JSON file: %s (line %d:%d)",
+                      error.text, error.line, error.column);
     }
-    *pjson = json_create(pool, j);
-    return APR_SUCCESS;
+    return (j && *pjson) ? APR_SUCCESS : APR_EINVAL;
 }
 
 static size_t load_file_cb(void *data, size_t max_len, void *baton)
@@ -1156,10 +1185,18 @@ apr_status_t md_json_readf(md_json_t **pjson, apr_pool_t *p, const char *fpath)
 apr_status_t md_json_read_http(md_json_t **pjson, apr_pool_t *pool, const md_http_response_t *res)
 {
     apr_status_t rv = APR_ENOENT;
-    const char *ctype = apr_table_get(res->headers, "content-type");
-    if (ctype && res->body && (strstr(ctype, "/json") || strstr(ctype, "+json"))) {
+    const char *ctype, *p;
+
+    *pjson = NULL;
+    if (!res->body) goto cleanup;
+    ctype = md_util_parse_ct(res->req->pool, apr_table_get(res->headers, "content-type"));
+    if (!ctype) goto cleanup;
+    p = ctype + strlen(ctype) +1;
+    if (!strcmp(p - sizeof("/json"), "/json")
+        || !strcmp(p - sizeof("+json"), "+json")) {
         rv = md_json_readb(pjson, pool, res->body);
     }
+cleanup:
     return rv;
 }
 
@@ -1227,7 +1264,7 @@ apr_status_t md_json_set_timeperiod(const md_timeperiod_t *tp, md_json_t *json, 
     const char *key;
     apr_status_t rv;
     
-    if (!tp || tp->start || tp->end) {
+    if (tp && tp->start && tp->end) {
         jn = json_object();
         apr_rfc822_date(ts, tp->start);
         json_object_set_new(jn, "from", json_string(ts));

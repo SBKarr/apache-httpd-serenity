@@ -319,7 +319,7 @@ static void read_quoted(char **string, char **quoted_part)
 static const char *imap_url(request_rec *r, const char *base, const char *value)
 {
 /* translates a value into a URL. */
-    int slen, clen;
+    apr_size_t slen, clen;
     char *string_pos = NULL;
     const char *string_pos_const = NULL;
     char *directory = NULL;
@@ -475,7 +475,7 @@ static int imap_reply(request_rec *r, const char *redirect)
 
 static void menu_header(request_rec *r, char *menu)
 {
-    ap_set_content_type(r, "text/html; charset=ISO-8859-1");
+    ap_set_content_type_ex(r, "text/html; charset=ISO-8859-1", 1);
 
     ap_rvputs(r, DOCTYPE_HTML_3_2, "<html><head>\n<title>Menu for ",
               ap_escape_html(r->pool, r->uri),

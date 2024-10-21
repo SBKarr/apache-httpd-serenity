@@ -115,7 +115,6 @@ static apr_status_t readfile_heartbeats(const char *path, apr_hash_t *servers,
 
     {
         char *t;
-        int lineno = 0;
         apr_bucket_alloc_t *ba = apr_bucket_alloc_create(pool);
         apr_bucket_brigade *bb = apr_brigade_create(pool, ba);
         apr_bucket_brigade *tmpbb = apr_brigade_create(pool, ba);
@@ -137,7 +136,6 @@ static apr_status_t readfile_heartbeats(const char *path, apr_hash_t *servers,
 
             rv = apr_brigade_split_line(tmpbb, bb,
                                         APR_BLOCK_READ, sizeof(buf));
-            lineno++;
 
             if (rv) {
                 return rv;
@@ -281,6 +279,7 @@ static proxy_worker *find_best_hb(proxy_balancer *balancer,
     }
 
     apr_pool_create(&tpool, r->pool);
+    apr_pool_tag(tpool, "lb_heartbeat_tpool");
 
     servers = apr_hash_make(tpool);
 
@@ -302,7 +301,7 @@ static proxy_worker *find_best_hb(proxy_balancer *balancer,
 
         if (!server) {
             ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO(01214)
-                      "lb_heartbeat: No server for worker %s", (*worker)->s->name);
+                      "lb_heartbeat: No server for worker %s", (*worker)->s->name_ex);
             continue;
         }
 

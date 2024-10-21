@@ -27,8 +27,7 @@
                                   see Recursive.''
                                         -- Unknown   */
 #include "ssl_private.h"
-#include "mod_ssl.h"
-#include "mod_ssl_openssl.h"
+
 #include "mpm_common.h"
 #include "mod_md.h"
 
@@ -91,7 +90,6 @@ static int DH_set0_pqg(DH *dh, BIGNUM *p, BIGNUM *q, BIGNUM *g)
 
     return 1;
 }
-#endif
 
 /*
  * Grab well-defined DH parameters from OpenSSL, see the BN_get_rfc*
@@ -171,6 +169,7 @@ DH *modssl_get_dh_params(unsigned keylen)
         
     return NULL; /* impossible to reach. */
 }
+#endif
 
 static void ssl_add_version_components(apr_pool_t *ptemp, apr_pool_t *pconf,
                                        server_rec *s)
@@ -195,23 +194,38 @@ static void ssl_add_version_components(apr_pool_t *ptemp, apr_pool_t *pconf,
 */
 
 int ssl_is_challenge(conn_rec *c, const char *servername, 
-                     X509 **pcert, EVP_PKEY **pkey)
+                     X509 **pcert, EVP_PKEY **pkey,
+                     const char **pcert_pem, const char **pkey_pem)
 {
-    if (APR_SUCCESS == ssl_run_answer_challenge(c, servername, pcert, pkey)) {
-        return 1;
-    }
     *pcert = NULL;
     *pkey = NULL;
+    *pcert_pem = *pkey_pem = NULL;
+    if (ap_ssl_answer_challenge(c, servername, pcert_pem, pkey_pem)) {
+        return 1;
+    }
+    else if (OK == ssl_run_answer_challenge(c, servername, pcert, pkey)) {
+        return 1;
+    }
     return 0;
 }
 
 #ifdef HAVE_FIPS
 static apr_status_t modssl_fips_cleanup(void *data)
 {
-    FIPS_mode_set(0);
+    modssl_fips_enable(0);
     return APR_SUCCESS;
 }
 #endif
+
+static APR_INLINE unsigned long modssl_runtime_lib_version(void)
+{
+#if MODSSL_USE_OPENSSL_PRE_1_1_API
+    return SSLeay();
+#else
+    return OpenSSL_version_num();
+#endif
+}
+
 
 /*
  *  Per-module initialization
@@ -220,18 +234,22 @@ apr_status_t ssl_init_Module(apr_pool_t *p, apr_pool_t *plog,
                              apr_pool_t *ptemp,
                              server_rec *base_server)
 {
+    unsigned long runtime_lib_version = modssl_runtime_lib_version();
     SSLModConfigRec *mc = myModConfig(base_server);
     SSLSrvConfigRec *sc;
     server_rec *s;
     apr_status_t rv;
     apr_array_header_t *pphrases;
 
-    if (SSLeay() < MODSSL_LIBRARY_VERSION) {
+    AP_DEBUG_ASSERT(mc);
+
+    if (runtime_lib_version < MODSSL_LIBRARY_VERSION) {
         ap_log_error(APLOG_MARK, APLOG_WARNING, 0, base_server, APLOGNO(01882)
                      "Init: this version of mod_ssl was compiled against "
-                     "a newer library (%s, version currently loaded is %s)"
+                     "a newer library (%s (%s), version currently loaded is 0x%lX)"
                      " - may result in undefined or erroneous behavior",
-                     MODSSL_LIBRARY_TEXT, MODSSL_LIBRARY_DYNTEXT);
+                    MODSSL_LIBRARY_TEXT, MODSSL_LIBRARY_DYNTEXT,
+                    runtime_lib_version);
     }
 
     /* We initialize mc->pid per-process in the child init,
@@ -299,12 +317,6 @@ apr_status_t ssl_init_Module(apr_pool_t *p, apr_pool_t *plog,
         if (sc->server && sc->server->pphrase_dialog_type == SSL_PPTYPE_UNSET) {
             sc->server->pphrase_dialog_type = SSL_PPTYPE_BUILTIN;
         }
-
-#ifdef HAVE_FIPS
-        if (sc->fips == UNSET) {
-            sc->fips = FALSE;
-        }
-#endif
     }
 
 #if APR_HAS_THREADS && MODSSL_USE_OPENSSL_PRE_1_1_API
@@ -314,13 +326,11 @@ apr_status_t ssl_init_Module(apr_pool_t *p, apr_pool_t *plog,
     /*
      * SSL external crypto device ("engine") support
      */
-#if defined(HAVE_OPENSSL_ENGINE_H) && defined(HAVE_ENGINE_INIT)
     if ((rv = ssl_init_Engine(base_server, p)) != APR_SUCCESS) {
         return rv;
     }
-#endif
 
-    ap_log_error(APLOG_MARK, APLOG_INFO, 0, s, APLOGNO(01883)
+    ap_log_error(APLOG_MARK, APLOG_INFO, 0, base_server, APLOGNO(01883)
                  "Init: Initialized %s library", MODSSL_LIBRARY_NAME);
 
     /*
@@ -331,24 +341,28 @@ apr_status_t ssl_init_Module(apr_pool_t *p, apr_pool_t *plog,
     ssl_rand_seed(base_server, ptemp, SSL_RSCTX_STARTUP, "Init: ");
 
 #ifdef HAVE_FIPS
-    if (sc->fips) {
-        if (!FIPS_mode()) {
-            if (FIPS_mode_set(1)) {
-                ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, s, APLOGNO(01884)
-                             "Operating in SSL FIPS mode");
-                apr_pool_cleanup_register(p, NULL, modssl_fips_cleanup,
-                                          apr_pool_cleanup_null);
-            }
-            else {
-                ap_log_error(APLOG_MARK, APLOG_EMERG, 0, s, APLOGNO(01885) "FIPS mode failed");
-                ssl_log_ssl_error(SSLLOG_MARK, APLOG_EMERG, s);
-                return ssl_die(s);
-            }
+    if (!modssl_fips_is_enabled() && mc->fips == TRUE) {
+        if (!modssl_fips_enable(1)) {
+            ap_log_error(APLOG_MARK, APLOG_EMERG, 0, base_server, APLOGNO(01885)
+                         "Could not enable FIPS mode");
+            ssl_log_ssl_error(SSLLOG_MARK, APLOG_EMERG, base_server);
+            return ssl_die(base_server);
         }
+
+        apr_pool_cleanup_register(p, NULL, modssl_fips_cleanup,
+                                  apr_pool_cleanup_null);
+    }
+
+    /* Log actual FIPS mode which the SSL library is operating under,
+     * which may have been set outside of the mod_ssl
+     * configuration. */
+    if (modssl_fips_is_enabled()) {
+        ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, base_server, APLOGNO(01884)
+                     MODSSL_LIBRARY_NAME " has FIPS mode enabled");
     }
     else {
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO(01886)
-                     "SSL FIPS mode disabled");
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, base_server, APLOGNO(01886)
+                     MODSSL_LIBRARY_NAME " has FIPS mode disabled");
     }
 #endif
 
@@ -435,21 +449,44 @@ apr_status_t ssl_init_Module(apr_pool_t *p, apr_pool_t *plog,
 
     modssl_init_app_data2_idx(); /* for modssl_get_app_data2() at request time */
 
+#if MODSSL_USE_OPENSSL_PRE_1_1_API
     init_dh_params();
-#if !MODSSL_USE_OPENSSL_PRE_1_1_API
+#else
     init_bio_methods();
 #endif
 
+#ifdef HAVE_OPENSSL_KEYLOG
+    {
+        const char *logfn = getenv("SSLKEYLOGFILE");
+
+        if (logfn) {
+            rv = apr_file_open(&mc->keylog_file, logfn,
+                               APR_FOPEN_CREATE|APR_FOPEN_WRITE|APR_FOPEN_APPEND|APR_FOPEN_LARGEFILE,
+                               APR_FPROT_UREAD|APR_FPROT_UWRITE,
+                               mc->pPool);
+            if (rv) {
+                ap_log_error(APLOG_MARK, APLOG_NOTICE, rv, s, APLOGNO(10226)
+                             "Could not open log file '%s' configured via SSLKEYLOGFILE",
+                             logfn);
+                return rv;
+            }
+
+            ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, s, APLOGNO(10227)
+                         "Init: Logging SSL private key material to %s", logfn);
+        }
+    }
+#endif
+    
     return OK;
 }
 
 /*
  * Support for external a Crypto Device ("engine"), usually
- * a hardware accellerator card for crypto operations.
+ * a hardware accelerator card for crypto operations.
  */
-#if defined(HAVE_OPENSSL_ENGINE_H) && defined(HAVE_ENGINE_INIT)
 apr_status_t ssl_init_Engine(server_rec *s, apr_pool_t *p)
 {
+#if MODSSL_HAVE_ENGINE_API
     SSLModConfigRec *mc = myModConfig(s);
     ENGINE *e;
 
@@ -481,10 +518,9 @@ apr_status_t ssl_init_Engine(server_rec *s, apr_pool_t *p)
 
         ENGINE_free(e);
     }
-
+#endif
     return APR_SUCCESS;
 }
-#endif
 
 #ifdef HAVE_TLSEXT
 static apr_status_t ssl_init_ctx_tls_extensions(server_rec *s,
@@ -801,6 +837,27 @@ static apr_status_t ssl_init_ctx_protocol(server_rec *s,
      * https://github.com/openssl/openssl/issues/7178 */
     SSL_CTX_clear_mode(ctx, SSL_MODE_AUTO_RETRY);
 #endif
+
+#ifdef HAVE_OPENSSL_KEYLOG
+    if (mctx->sc->mc->keylog_file) {
+        SSL_CTX_set_keylog_callback(ctx, modssl_callback_keylog);
+    }
+#endif
+
+#ifdef SSL_OP_NO_RENEGOTIATION
+    /* For server-side SSL_CTX, disable renegotiation by default.. */
+    if (!mctx->pkp) {
+        SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION);
+    }
+#endif
+
+#ifdef SSL_OP_IGNORE_UNEXPECTED_EOF
+    /* For server-side SSL_CTX, enable ignoring unexpected EOF */
+    /* (OpenSSL 1.1.1 behavioural compatibility).. */
+    if (!mctx->pkp) {
+        SSL_CTX_set_options(ctx, SSL_OP_IGNORE_UNEXPECTED_EOF);
+    }
+#endif
     
     return APR_SUCCESS;
 }
@@ -822,6 +879,14 @@ static void ssl_init_ctx_session_cache(server_rec *s,
     }
 }
 
+#ifdef SSL_OP_NO_RENEGOTIATION
+/* OpenSSL-level renegotiation protection. */
+#define MODSSL_BLOCKS_RENEG (0)
+#else
+/* mod_ssl-level renegotiation protection. */
+#define MODSSL_BLOCKS_RENEG (1)
+#endif
+
 static void ssl_init_ctx_callbacks(server_rec *s,
                                    apr_pool_t *p,
                                    apr_pool_t *ptemp,
@@ -829,13 +894,40 @@ static void ssl_init_ctx_callbacks(server_rec *s,
 {
     SSL_CTX *ctx = mctx->ssl_ctx;
 
+#if MODSSL_USE_OPENSSL_PRE_1_1_API
+    /* Note that for OpenSSL>=1.1, auto selection is enabled via
+     * SSL_CTX_set_dh_auto(,1) if no parameter is configured. */
     SSL_CTX_set_tmp_dh_callback(ctx,  ssl_callback_TmpDH);
+#endif
 
-    SSL_CTX_set_info_callback(ctx, ssl_callback_Info);
+    /* The info callback is used for debug-level tracing.  For OpenSSL
+     * versions where SSL_OP_NO_RENEGOTIATION is not available, the
+     * callback is also used to prevent use of client-initiated
+     * renegotiation.  Enable it in either case. */
+    if (APLOGdebug(s) || MODSSL_BLOCKS_RENEG) {
+        SSL_CTX_set_info_callback(ctx, ssl_callback_Info);
+    }
 
 #ifdef HAVE_TLS_ALPN
     SSL_CTX_set_alpn_select_cb(ctx, ssl_callback_alpn_select, NULL);
 #endif
+}
+
+static APR_INLINE
+int modssl_CTX_load_verify_locations(SSL_CTX *ctx,
+                                     const char *file,
+                                     const char *path)
+{
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    if (!SSL_CTX_load_verify_locations(ctx, file, path))
+        return 0;
+#else
+    if (file && !SSL_CTX_load_verify_file(ctx, file))
+        return 0;
+    if (path && !SSL_CTX_load_verify_dir(ctx, path))
+        return 0;
+#endif
+    return 1;
 }
 
 static apr_status_t ssl_init_ctx_verify(server_rec *s,
@@ -878,10 +970,8 @@ static apr_status_t ssl_init_ctx_verify(server_rec *s,
         ap_log_error(APLOG_MARK, APLOG_TRACE1, 0, s,
                      "Configuring client authentication");
 
-        if (!SSL_CTX_load_verify_locations(ctx,
-                                           mctx->auth.ca_cert_file,
-                                           mctx->auth.ca_cert_path))
-        {
+        if (!modssl_CTX_load_verify_locations(ctx, mctx->auth.ca_cert_file,
+                                                   mctx->auth.ca_cert_path)) {
             ap_log_error(APLOG_MARK, APLOG_EMERG, 0, s, APLOGNO(01895)
                     "Unable to configure verify locations "
                     "for client authentication");
@@ -966,6 +1056,23 @@ static apr_status_t ssl_init_ctx_cipher_suite(server_rec *s,
     return APR_SUCCESS;
 }
 
+static APR_INLINE
+int modssl_X509_STORE_load_locations(X509_STORE *store,
+                                     const char *file,
+                                     const char *path)
+{
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    if (!X509_STORE_load_locations(store, file, path))
+        return 0;
+#else
+    if (file && !X509_STORE_load_file(store, file))
+        return 0;
+    if (path && !X509_STORE_load_path(store, path))
+        return 0;
+#endif
+    return 1;
+}
+
 static apr_status_t ssl_init_ctx_crl(server_rec *s,
                                      apr_pool_t *p,
                                      apr_pool_t *ptemp,
@@ -1004,8 +1111,8 @@ static apr_status_t ssl_init_ctx_crl(server_rec *s,
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO(01900)
                  "Configuring certificate revocation facility");
 
-    if (!store || !X509_STORE_load_locations(store, mctx->crl_file,
-                                             mctx->crl_path)) {
+    if (!store || !modssl_X509_STORE_load_locations(store, mctx->crl_file,
+                                                           mctx->crl_path)) {
         ap_log_error(APLOG_MARK, APLOG_EMERG, 0, s, APLOGNO(01901)
                      "Host %s: unable to configure X.509 CRL storage "
                      "for certificate revocation", mctx->sc->vhost_id);
@@ -1234,6 +1341,22 @@ static int ssl_no_passwd_prompt_cb(char *buf, int size, int rwflag,
    return 0;
 }
 
+/* SSL_CTX_use_PrivateKey_file() can fail either because the private
+ * key was encrypted, or due to a mismatch between an already-loaded
+ * cert and the key - a common misconfiguration - from calling
+ * X509_check_private_key().  This macro is passed the last error code
+ * off the OpenSSL stack and evaluates to true only for the first
+ * case.  With OpenSSL < 3 the second case is identifiable by the
+ * function code, but function codes are not used from 3.0. */
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+#define CHECK_PRIVKEY_ERROR(ec) (ERR_GET_FUNC(ec) != X509_F_X509_CHECK_PRIVATE_KEY)
+#else
+#define CHECK_PRIVKEY_ERROR(ec) (ERR_GET_LIB(ec) != ERR_LIB_X509            \
+                                 || (ERR_GET_REASON(ec) != X509_R_KEY_TYPE_MISMATCH \
+                                     && ERR_GET_REASON(ec) != X509_R_KEY_VALUES_MISMATCH \
+                                     && ERR_GET_REASON(ec) != X509_R_UNKNOWN_KEY_TYPE))
+#endif
+
 static apr_status_t ssl_init_server_certs(server_rec *s,
                                           apr_pool_t *p,
                                           apr_pool_t *ptemp,
@@ -1243,15 +1366,11 @@ static apr_status_t ssl_init_server_certs(server_rec *s,
     SSLModConfigRec *mc = myModConfig(s);
     const char *vhost_id = mctx->sc->vhost_id, *key_id, *certfile, *keyfile;
     int i;
-    X509 *cert;
-    DH *dhparams;
+    EVP_PKEY *pkey;
+    int custom_dh_done = 0;
 #ifdef HAVE_ECC
-    EC_GROUP *ecparams = NULL;
-    int nid;
-    EC_KEY *eckey = NULL;
-#endif
-#ifndef HAVE_SSL_CONF_CMD
-    SSL *ssl;
+    EC_GROUP *ecgroup = NULL;
+    int curve_nid = 0;
 #endif
 
     /* no OpenSSL default prompts for any of the SSL_CTX_use_* calls, please */
@@ -1262,7 +1381,7 @@ static apr_status_t ssl_init_server_certs(server_rec *s,
                 (certfile = APR_ARRAY_IDX(mctx->pks->cert_files, i,
                                           const char *));
          i++) {
-        EVP_PKEY *pkey;
+        X509 *cert = NULL;
         const char *engine_certfile = NULL;
 
         key_id = apr_psprintf(ptemp, "%s:%d", vhost_id, i);
@@ -1305,9 +1424,7 @@ static apr_status_t ssl_init_server_certs(server_rec *s,
         if (modssl_is_engine_id(keyfile)) {
             apr_status_t rv;
 
-            cert = NULL;
-            
-            if ((rv = modssl_load_engine_keypair(s, ptemp, vhost_id,
+            if ((rv = modssl_load_engine_keypair(s, p, ptemp, vhost_id,
                                                  engine_certfile, keyfile,
                                                  &cert, &pkey))) {
                 return rv;
@@ -1316,8 +1433,10 @@ static apr_status_t ssl_init_server_certs(server_rec *s,
             if (cert) {
                 if (SSL_CTX_use_certificate(mctx->ssl_ctx, cert) < 1) {
                     ap_log_error(APLOG_MARK, APLOG_EMERG, 0, s, APLOGNO(10137)
-                                 "Failed to configure engine certificate %s, check %s",
-                                 key_id, certfile);
+                                 "Failed to configure certificate %s from %s, check %s",
+                                 key_id, mc->szCryptoDevice ?
+                                             mc->szCryptoDevice : "provider",
+                                 certfile);
                     ssl_log_ssl_error(SSLLOG_MARK, APLOG_EMERG, s);
                     return APR_EGENERAL;
                 }
@@ -1328,8 +1447,9 @@ static apr_status_t ssl_init_server_certs(server_rec *s,
             
             if (SSL_CTX_use_PrivateKey(mctx->ssl_ctx, pkey) < 1) {
                 ap_log_error(APLOG_MARK, APLOG_EMERG, 0, s, APLOGNO(10130)
-                             "Failed to configure private key %s from engine",
-                             keyfile);
+                             "Failed to configure private key %s from %s",
+                             keyfile, mc->szCryptoDevice ?
+                                          mc->szCryptoDevice : "provider");
                 ssl_log_ssl_error(SSLLOG_MARK, APLOG_EMERG, s);
                 return APR_EGENERAL;
             }
@@ -1339,8 +1459,7 @@ static apr_status_t ssl_init_server_certs(server_rec *s,
         }
         else if ((SSL_CTX_use_PrivateKey_file(mctx->ssl_ctx, keyfile,
                                               SSL_FILETYPE_PEM) < 1)
-                 && (ERR_GET_FUNC(ERR_peek_last_error())
-                     != X509_F_X509_CHECK_PRIVATE_KEY)) {
+                 && CHECK_PRIVKEY_ERROR(ERR_peek_last_error())) {
             ssl_asn1_t *asn1;
             const unsigned char *ptr;
 
@@ -1378,22 +1497,21 @@ static apr_status_t ssl_init_server_certs(server_rec *s,
          * assume that if SSL_CONF is available, it's OpenSSL 1.0.2 or later,
          * and SSL_CTX_get0_certificate is implemented.)
          */
-        if (!(cert = SSL_CTX_get0_certificate(mctx->ssl_ctx))) {
+        cert = SSL_CTX_get0_certificate(mctx->ssl_ctx);
 #else
-        ssl = SSL_new(mctx->ssl_ctx);
-        if (ssl) {
-            /* Workaround bug in SSL_get_certificate in OpenSSL 0.9.8y */
-            SSL_set_connect_state(ssl);
-            cert = SSL_get_certificate(ssl);
+        {
+            SSL *ssl = SSL_new(mctx->ssl_ctx);
+            if (ssl) {
+                /* Workaround bug in SSL_get_certificate in OpenSSL 0.9.8y */
+                SSL_set_connect_state(ssl);
+                cert = SSL_get_certificate(ssl);
+                SSL_free(ssl);
+            }
         }
-        if (!ssl || !cert) {
 #endif
+        if (!cert) {
             ap_log_error(APLOG_MARK, APLOG_ERR, 0, s, APLOGNO(02566)
                          "Unable to retrieve certificate %s", key_id);
-#ifndef HAVE_SSL_CONF_CMD
-            if (ssl)
-                SSL_free(ssl);
-#endif
             return APR_EGENERAL;
         }
 
@@ -1415,10 +1533,6 @@ static apr_status_t ssl_init_server_certs(server_rec *s,
         }
 #endif
 
-#ifndef HAVE_SSL_CONF_CMD
-        SSL_free(ssl);
-#endif
-
         ap_log_error(APLOG_MARK, APLOG_INFO, 0, s, APLOGNO(02568)
                      "Certificate and private key %s configured from %s and %s",
                      key_id, certfile, keyfile);
@@ -1428,27 +1542,68 @@ static apr_status_t ssl_init_server_certs(server_rec *s,
      * Try to read DH parameters from the (first) SSLCertificateFile
      */
     certfile = APR_ARRAY_IDX(mctx->pks->cert_files, 0, const char *);
-    if (certfile && !modssl_is_engine_id(certfile)
-        && (dhparams = ssl_dh_GetParamFromFile(certfile))) {
-        SSL_CTX_set_tmp_dh(mctx->ssl_ctx, dhparams);
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO(02540)
-                     "Custom DH parameters (%d bits) for %s loaded from %s",
-                     DH_bits(dhparams), vhost_id, certfile);
-        DH_free(dhparams);
+    if (certfile && !modssl_is_engine_id(certfile)) {
+        int num_bits = 0;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+        DH *dh = modssl_dh_from_file(certfile);
+        if (dh) {
+            num_bits = DH_bits(dh);
+            SSL_CTX_set_tmp_dh(mctx->ssl_ctx, dh);
+            DH_free(dh);
+            custom_dh_done = 1;
+        }
+#else
+        pkey = modssl_dh_pkey_from_file(certfile);
+        if (pkey) {
+            num_bits = EVP_PKEY_get_bits(pkey);
+            if (!SSL_CTX_set0_tmp_dh_pkey(mctx->ssl_ctx, pkey)) {
+                EVP_PKEY_free(pkey);
+            }
+            else {
+                custom_dh_done = 1;
+            }
+        }
+#endif
+        if (custom_dh_done) {
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO(02540)
+                         "Custom DH parameters (%d bits) for %s loaded from %s",
+                         num_bits, vhost_id, certfile);
+        }
     }
+#if !MODSSL_USE_OPENSSL_PRE_1_1_API
+    if (!custom_dh_done) {
+        /* If no parameter is manually configured, enable auto
+         * selection. */
+        SSL_CTX_set_dh_auto(mctx->ssl_ctx, 1);
+    }
+#endif
 
 #ifdef HAVE_ECC
     /*
      * Similarly, try to read the ECDH curve name from SSLCertificateFile...
      */
     if (certfile && !modssl_is_engine_id(certfile)
-        && (ecparams = ssl_ec_GetParamFromFile(certfile))
-        && (nid = EC_GROUP_get_curve_name(ecparams)) 
-        && (eckey = EC_KEY_new_by_curve_name(nid))) {
-        SSL_CTX_set_tmp_ecdh(mctx->ssl_ctx, eckey);
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO(02541)
-                     "ECDH curve %s for %s specified in %s",
-                     OBJ_nid2sn(nid), vhost_id, certfile);
+        && (ecgroup = modssl_ec_group_from_file(certfile))
+        && (curve_nid = EC_GROUP_get_curve_name(ecgroup))) {
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+        EC_KEY *eckey = EC_KEY_new_by_curve_name(curve_nid);
+        if (eckey) {
+            SSL_CTX_set_tmp_ecdh(mctx->ssl_ctx, eckey);
+            EC_KEY_free(eckey);
+        }
+        else {
+            curve_nid = 0;
+        }
+#else
+        if (!SSL_CTX_set1_curves(mctx->ssl_ctx, &curve_nid, 1)) {
+            curve_nid = 0;
+        }
+#endif
+        if (curve_nid) {
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO(02541)
+                         "ECDH curve %s for %s specified in %s",
+                         OBJ_nid2sn(curve_nid), vhost_id, certfile);
+        }
     }
     /*
      * ...otherwise, enable auto curve selection (OpenSSL 1.0.2)
@@ -1456,18 +1611,20 @@ static apr_status_t ssl_init_server_certs(server_rec *s,
      * ECDH is always enabled in 1.1.0 unless excluded from SSLCipherList
      */
 #if MODSSL_USE_OPENSSL_PRE_1_1_API
-    else {
+    if (!curve_nid) {
 #if defined(SSL_CTX_set_ecdh_auto)
         SSL_CTX_set_ecdh_auto(mctx->ssl_ctx, 1);
 #else
-        eckey = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
-        SSL_CTX_set_tmp_ecdh(mctx->ssl_ctx, eckey);
+        EC_KEY *eckey = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+        if (eckey) {
+            SSL_CTX_set_tmp_ecdh(mctx->ssl_ctx, eckey);
+            EC_KEY_free(eckey);
+        }
 #endif
     }
 #endif
     /* OpenSSL assures us that _free() is NULL-safe */
-    EC_KEY_free(eckey);
-    EC_GROUP_free(ecparams);
+    EC_GROUP_free(ecgroup);
 #endif
 
     return APR_SUCCESS;
@@ -1485,6 +1642,7 @@ static apr_status_t ssl_init_ticket_key(server_rec *s,
     char buf[TLSEXT_TICKET_KEY_LEN];
     char *path;
     modssl_ticket_key_t *ticket_key = mctx->ticket_key;
+    int res;
 
     if (!ticket_key->file_path) {
         return APR_SUCCESS;
@@ -1512,11 +1670,22 @@ static apr_status_t ssl_init_ticket_key(server_rec *s,
     }
 
     memcpy(ticket_key->key_name, buf, 16);
-    memcpy(ticket_key->hmac_secret, buf + 16, 16);
     memcpy(ticket_key->aes_key, buf + 32, 16);
-
-    if (!SSL_CTX_set_tlsext_ticket_key_cb(mctx->ssl_ctx,
-                                          ssl_callback_SessionTicket)) {
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    memcpy(ticket_key->hmac_secret, buf + 16, 16);
+    res = SSL_CTX_set_tlsext_ticket_key_cb(mctx->ssl_ctx,
+                                           ssl_callback_SessionTicket);
+#else
+    ticket_key->mac_params[0] =
+        OSSL_PARAM_construct_octet_string(OSSL_MAC_PARAM_KEY, buf + 16, 16);
+    ticket_key->mac_params[1] =
+        OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, "sha256", 0);
+    ticket_key->mac_params[2] =
+        OSSL_PARAM_construct_end();
+    res = SSL_CTX_set_tlsext_ticket_key_evp_cb(mctx->ssl_ctx,
+                                               ssl_callback_SessionTicket);
+#endif
+    if (!res) {
         ap_log_error(APLOG_MARK, APLOG_EMERG, 0, s, APLOGNO(01913)
                      "Unable to initialize TLS session ticket key callback "
                      "(incompatible OpenSSL version?)");
@@ -1567,8 +1736,12 @@ static apr_status_t ssl_init_proxy_certs(server_rec *s,
     STACK_OF(X509) *chain;
     X509_STORE_CTX *sctx;
     X509_STORE *store = SSL_CTX_get_cert_store(mctx->ssl_ctx);
+    int addl_chain = 0; /* non-zero if additional chain certs were
+                         * added to store */
 
-#if OPENSSL_VERSION_NUMBER >= 0x1010100fL
+    ap_assert(store != NULL); /* safe to assume always non-NULL? */
+
+#if OPENSSL_VERSION_NUMBER >= 0x1010100fL && !defined(LIBRESSL_VERSION_NUMBER)
     /* For OpenSSL >=1.1.1, turn on client cert support which is
      * otherwise turned off by default (by design).
      * https://github.com/openssl/openssl/issues/6933 */
@@ -1592,20 +1765,28 @@ static apr_status_t ssl_init_proxy_certs(server_rec *s,
         ssl_init_ca_cert_path(s, ptemp, pkp->cert_path, NULL, sk);
     }
 
-    if ((ncerts = sk_X509_INFO_num(sk)) <= 0) {
-        sk_X509_INFO_free(sk);
-        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, s, APLOGNO(02206)
-                     "no client certs found for SSL proxy");
-        return APR_SUCCESS;
-    }
-
     /* Check that all client certs have got certificates and private
-     * keys. */
-    for (n = 0; n < ncerts; n++) {
+     * keys.  Note the number of certs in the stack may decrease
+     * during the loop. */
+    for (n = 0; n < sk_X509_INFO_num(sk); n++) {
         X509_INFO *inf = sk_X509_INFO_value(sk, n);
+        int has_privkey = inf->x_pkey && inf->x_pkey->dec_pkey;
 
-        if (!inf->x509 || !inf->x_pkey || !inf->x_pkey->dec_pkey ||
-            inf->enc_data) {
+        /* For a lone certificate in the file, trust it as a
+         * CA/intermediate certificate. */
+        if (inf->x509 && !has_privkey && !inf->enc_data) {
+            ssl_log_xerror(SSLLOG_MARK, APLOG_DEBUG, 0, ptemp, s, inf->x509,
+                           APLOGNO(10261) "Trusting non-leaf certificate");
+            X509_STORE_add_cert(store, inf->x509); /* increments inf->x509 */
+            /* Delete from the stack and iterate again. */
+            X509_INFO_free(inf);
+            sk_X509_INFO_delete(sk, n);
+            n--;
+            addl_chain = 1;
+            continue;
+        }
+
+        if (!has_privkey || inf->enc_data) {
             sk_X509_INFO_free(sk);
             ap_log_error(APLOG_MARK, APLOG_STARTUP, 0, s, APLOGNO(02252)
                          "incomplete client cert configured for SSL proxy "
@@ -1622,13 +1803,21 @@ static apr_status_t ssl_init_proxy_certs(server_rec *s,
         }
     }
 
+    if ((ncerts = sk_X509_INFO_num(sk)) <= 0) {
+        sk_X509_INFO_free(sk);
+        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, s, APLOGNO(02206)
+                     "no client certs found for SSL proxy");
+        return APR_SUCCESS;
+    }
+
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO(02207)
                  "loaded %d client certs for SSL proxy",
                  ncerts);
     pkp->certs = sk;
 
-
-    if (!pkp->ca_cert_file || !store) {
+    /* If any chain certs are configured, build the ->ca_certs chains
+     * corresponding to the loaded keypairs. */
+    if (!pkp->ca_cert_file && !addl_chain) {
         return APR_SUCCESS;
     }
 
@@ -1644,16 +1833,21 @@ static apr_status_t ssl_init_proxy_certs(server_rec *s,
         ap_log_error(APLOG_MARK, APLOG_EMERG, 0, s, APLOGNO(02208)
                      "SSL proxy client cert initialization failed");
         ssl_log_ssl_error(SSLLOG_MARK, APLOG_EMERG, s);
+        sk_X509_INFO_free(sk);
         return ssl_die(s);
     }
 
-    X509_STORE_load_locations(store, pkp->ca_cert_file, NULL);
+    modssl_X509_STORE_load_locations(store, pkp->ca_cert_file, NULL);
 
     for (n = 0; n < ncerts; n++) {
         int i;
 
         X509_INFO *inf = sk_X509_INFO_value(pkp->certs, n);
-        X509_STORE_CTX_init(sctx, store, inf->x509, NULL);
+        if (!X509_STORE_CTX_init(sctx, store, inf->x509, NULL)) {
+            sk_X509_INFO_free(sk);
+            X509_STORE_CTX_free(sctx);
+            return ssl_die(s);
+        }
 
         /* Attempt to verify the client cert */
         if (X509_verify_cert(sctx) != 1) {
@@ -1805,10 +1999,12 @@ static apr_status_t ssl_init_server_ctx(server_rec *s,
     /* Allow others to provide certificate files */
     pks = sc->server->pks;
     n = pks->cert_files->nelts;
+    ap_ssl_add_cert_files(s, p, pks->cert_files, pks->key_files);
     ssl_run_add_cert_files(s, p, pks->cert_files, pks->key_files);
 
     if (apr_is_empty_array(pks->cert_files)) {
         /* does someone propose a certiciate to fall back on here? */
+        ap_ssl_add_fallback_cert_files(s, p, pks->cert_files, pks->key_files);
         ssl_run_add_fallback_cert_files(s, p, pks->cert_files, pks->key_files);
         if (n < pks->cert_files->nelts) {
             pks->service_unavailable = 1;
@@ -2071,52 +2267,6 @@ int ssl_proxy_section_post_config(apr_pool_t *p, apr_pool_t *plog,
     return OK;
 }
 
-static int ssl_init_FindCAList_X509NameCmp(const X509_NAME * const *a,
-                                           const X509_NAME * const *b)
-{
-    return(X509_NAME_cmp(*a, *b));
-}
-
-static void ssl_init_PushCAList(STACK_OF(X509_NAME) *ca_list,
-                                server_rec *s, apr_pool_t *ptemp,
-                                const char *file)
-{
-    int n;
-    STACK_OF(X509_NAME) *sk;
-
-    sk = (STACK_OF(X509_NAME) *)
-             SSL_load_client_CA_file(file);
-
-    if (!sk) {
-        return;
-    }
-
-    for (n = 0; n < sk_X509_NAME_num(sk); n++) {
-        X509_NAME *name = sk_X509_NAME_value(sk, n);
-
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO(02209)
-                     "CA certificate: %s",
-                     modssl_X509_NAME_to_string(ptemp, name, 0));
-
-        /*
-         * note that SSL_load_client_CA_file() checks for duplicates,
-         * but since we call it multiple times when reading a directory
-         * we must also check for duplicates ourselves.
-         */
-
-        if (sk_X509_NAME_find(ca_list, name) < 0) {
-            /* this will be freed when ca_list is */
-            sk_X509_NAME_push(ca_list, name);
-        }
-        else {
-            /* need to free this ourselves, else it will leak */
-            X509_NAME_free(name);
-        }
-    }
-
-    sk_X509_NAME_free(sk);
-}
-
 static apr_status_t ssl_init_ca_cert_path(server_rec *s,
                                           apr_pool_t *ptemp,
                                           const char *path,
@@ -2139,7 +2289,7 @@ static apr_status_t ssl_init_ca_cert_path(server_rec *s,
         }
         file = apr_pstrcat(ptemp, path, "/", direntry.name, NULL);
         if (ca_list) {
-            ssl_init_PushCAList(ca_list, s, ptemp, file);
+            SSL_add_file_cert_subjects_to_stack(ca_list, file);
         }
         if (xi_list) {
             load_x509_info(ptemp, xi_list, file);
@@ -2156,19 +2306,13 @@ STACK_OF(X509_NAME) *ssl_init_FindCAList(server_rec *s,
                                          const char *ca_file,
                                          const char *ca_path)
 {
-    STACK_OF(X509_NAME) *ca_list;
-
-    /*
-     * Start with a empty stack/list where new
-     * entries get added in sorted order.
-     */
-    ca_list = sk_X509_NAME_new(ssl_init_FindCAList_X509NameCmp);
+    STACK_OF(X509_NAME) *ca_list = sk_X509_NAME_new_null();;
 
     /*
      * Process CA certificate bundle file
      */
     if (ca_file) {
-        ssl_init_PushCAList(ca_list, s, ptemp, ca_file);
+        SSL_add_file_cert_subjects_to_stack(ca_list, ca_file);
         /*
          * If ca_list is still empty after trying to load ca_file
          * then the file failed to load, and users should hear about that.
@@ -2191,11 +2335,6 @@ STACK_OF(X509_NAME) *ssl_init_FindCAList(server_rec *s,
         sk_X509_NAME_pop_free(ca_list, X509_NAME_free);
         return NULL;
     }
-
-    /*
-     * Cleanup
-     */
-    (void) sk_X509_NAME_set_cmp_func(ca_list, NULL);
 
     return ca_list;
 }
@@ -2242,10 +2381,11 @@ apr_status_t ssl_init_ModuleKill(void *data)
 
     }
 
-#if !MODSSL_USE_OPENSSL_PRE_1_1_API
+#if MODSSL_USE_OPENSSL_PRE_1_1_API
+    free_dh_params();
+#else
     free_bio_methods();
 #endif
-    free_dh_params();
 
     return APR_SUCCESS;
 }

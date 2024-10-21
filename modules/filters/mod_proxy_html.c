@@ -679,7 +679,7 @@ static meta *metafix(request_rec *r, const char *buf, apr_size_t len)
         while (!apr_isalpha(*++p));
         for (q = p; apr_isalnum(*q) || (*q == '-'); ++q);
         header = apr_pstrmemdup(r->pool, p, q-p);
-        if (strncasecmp(header, "Content-", 8)) {
+        if (ap_cstr_casecmpn(header, "Content-", 8)) {
             /* find content=... string */
             p = apr_strmatch(seek_content, buf+offs+pmatch[0].rm_so,
                               pmatch[0].rm_eo - pmatch[0].rm_so);
@@ -707,7 +707,7 @@ static meta *metafix(request_rec *r, const char *buf, apr_size_t len)
                 }
             }
         }
-        else if (!strncasecmp(header, "Content-Type", 12)) {
+        else if (!ap_cstr_casecmpn(header, "Content-Type", 12)) {
             ret = apr_palloc(r->pool, sizeof(meta));
             ret->start = offs+pmatch[0].rm_so;
             ret->end = offs+pmatch[0].rm_eo;
@@ -836,8 +836,8 @@ static saxctxt *check_filter_init (ap_filter_t *f)
             else if (!f->r->content_type) {
                 errmsg = "No content-type; bailing out of proxy-html filter";
             }
-            else if (strncasecmp(f->r->content_type, "text/html", 9) &&
-                     strncasecmp(f->r->content_type,
+            else if (ap_cstr_casecmpn(f->r->content_type, "text/html", 9) &&
+                     ap_cstr_casecmpn(f->r->content_type,
                                  "application/xhtml+xml", 21)) {
                 errmsg = "Non-HTML content; not inserting proxy-html filter";
             }
@@ -952,7 +952,7 @@ static apr_status_t proxy_html_filter(ap_filter_t *f, apr_bucket_brigade *bb)
                         ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, f->r, APLOGNO(01422)
                                       "No i18n support found.  Install mod_xml2enc if required");
                     enc = XML_CHAR_ENCODING_NONE;
-                    ap_set_content_type(f->r, "text/html;charset=utf-8");
+                    ap_set_content_type_ex(f->r, "text/html;charset=utf-8", 1);
                 }
                 else {
                     /* if we wanted a non-default charset_out, insert the
@@ -968,7 +968,7 @@ static apr_status_t proxy_html_filter(ap_filter_t *f, apr_bucket_brigade *bb)
                                                         cenc, NULL));
                     }
                     else /* Normal case, everything worked, utf-8 output */
-                        ap_set_content_type(f->r, "text/html;charset=utf-8");
+                        ap_set_content_type_ex(f->r, "text/html;charset=utf-8", 1);
                 }
 
                 ap_fputs(f->next, ctxt->bb, ctxt->cfg->doctype);

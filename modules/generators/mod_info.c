@@ -230,7 +230,7 @@ static int mod_info_has_cmd(const command_rec * cmds, ap_directive_t * dir)
     if (cmds == NULL)
         return 1;
     for (cmd = cmds; cmd->name; ++cmd) {
-        if (strcasecmp(cmd->name, dir->directive) == 0)
+        if (ap_cstr_casecmp(cmd->name, dir->directive) == 0)
             return 1;
     }
     return 0;
@@ -322,6 +322,7 @@ static const hook_lookup_t request_hooks[] = {
     {"HTTP Scheme", ap_hook_get_http_scheme},
     {"Default Port", ap_hook_get_default_port},
     {"Quick Handler", ap_hook_get_quick_handler},
+    {"Pre-Translate Name", ap_hook_get_pre_translate_name},
     {"Translate Name", ap_hook_get_translate_name},
     {"Map to Storage", ap_hook_get_map_to_storage},
     {"Check Access", ap_hook_get_access_checker_ex},
@@ -453,6 +454,12 @@ static int show_server_settings(request_rec * r)
                "<dt><strong>Compiled with APU Version:</strong> "
                "<tt>%s</tt></dt>\n", APU_VERSION_STRING);
 #endif
+    ap_rprintf(r,
+               "<dt><strong>Server loaded PCRE Version:</strong> "
+               "<tt>%s</tt></dt>\n", ap_pcre_version_string(AP_REG_PCRE_LOADED));
+    ap_rprintf(r,
+               "<dt><strong>Compiled with PCRE Version:</strong> "
+               "<tt>%s</tt></dt>\n", ap_pcre_version_string(AP_REG_PCRE_COMPILED));
     ap_rprintf(r,
                "<dt><strong>Module Magic Number:</strong> "
                "<tt>%d:%d</tt></dt>\n", MODULE_MAGIC_NUMBER_MAJOR,
@@ -777,7 +784,7 @@ static int display_info(request_rec * r)
         return DECLINED;
     }
 
-    ap_set_content_type(r, "text/html; charset=ISO-8859-1");
+    ap_set_content_type_ex(r, "text/html; charset=ISO-8859-1", 1);
 
     ap_rputs(DOCTYPE_XHTML_1_0T
              "<html xmlns=\"http://www.w3.org/1999/xhtml\">\n"
@@ -785,7 +792,7 @@ static int display_info(request_rec * r)
              "  <title>Server Information</title>\n" "</head>\n", r);
     ap_rputs("<body><h1 style=\"text-align: center\">"
              "Apache Server Information</h1>\n", r);
-    if (!r->args || strcasecmp(r->args, "list")) {
+    if (!r->args || ap_cstr_casecmp(r->args, "list")) {
         if (!r->args) {
             ap_rputs("<dl><dt><tt>Subpages:<br />", r);
             ap_rputs("<a href=\"?config\">Configuration Files</a>, "
@@ -819,19 +826,19 @@ static int display_info(request_rec * r)
             ap_rputs("</tt></dt></dl><hr />", r);
         }
 
-        if (!r->args || !strcasecmp(r->args, "server")) {
+        if (!r->args || !ap_cstr_casecmp(r->args, "server")) {
             show_server_settings(r);
         }
 
-        if (!r->args || !strcasecmp(r->args, "hooks")) {
+        if (!r->args || !ap_cstr_casecmp(r->args, "hooks")) {
             show_active_hooks(r);
         }
 
-        if (!r->args || !strcasecmp(r->args, "providers")) {
+        if (!r->args || !ap_cstr_casecmp(r->args, "providers")) {
             show_providers(r);
         }
 
-        if (r->args && 0 == strcasecmp(r->args, "config")) {
+        if (r->args && 0 == ap_cstr_casecmp(r->args, "config")) {
             ap_rputs("<dl><dt><strong>Configuration:</strong>\n", r);
             mod_info_module_cmds(r, NULL, ap_conftree, 0, 0);
             ap_rputs("</dl><hr />", r);
@@ -842,7 +849,7 @@ static int display_info(request_rec * r)
                  modules = get_sorted_modules(r->pool);
             for (i = 0; i < modules->nelts; i++) {
                 modp = APR_ARRAY_IDX(modules, i, module *);
-                if (!r->args || !strcasecmp(modp->name, r->args)) {
+                if (!r->args || !ap_cstr_casecmp(modp->name, r->args)) {
                     ap_rprintf(r,
                                "<dl><dt><a name=\"%s\"><strong>Module Name:</strong></a> "
                                "<font size=\"+1\"><tt><a href=\"?%s\">%s</a></tt></font></dt>\n",
@@ -940,7 +947,7 @@ static int display_info(request_rec * r)
                     }
                 }
             }
-            if (!modp && r->args && strcasecmp(r->args, "server")) {
+            if (!modp && r->args && ap_cstr_casecmp(r->args, "server")) {
                 ap_rputs("<p><b>No such module</b></p>\n", r);
             }
         }

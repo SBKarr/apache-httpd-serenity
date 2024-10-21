@@ -76,57 +76,6 @@ static void authz_req_ctx_init(authz_req_ctx *ctx, md_acme_t *acme,
     ctx->authz = authz;
 }
 
-static apr_status_t on_init_authz(md_acme_req_t *req, void *baton)
-{
-    authz_req_ctx *ctx = baton;
-    md_json_t *jpayload;
-
-    jpayload = md_json_create(req->p);
-    md_json_sets("new-authz", jpayload, MD_KEY_RESOURCE, NULL);
-    md_json_sets("dns", jpayload, MD_KEY_IDENTIFIER, MD_KEY_TYPE, NULL);
-    md_json_sets(ctx->domain, jpayload, MD_KEY_IDENTIFIER, MD_KEY_VALUE, NULL);
-    
-    return md_acme_req_body_init(req, jpayload);
-} 
-
-static apr_status_t authz_created(md_acme_t *acme, apr_pool_t *p, const apr_table_t *hdrs, 
-                                  md_json_t *body, void *baton)
-{
-    authz_req_ctx *ctx = baton;
-    const char *location = apr_table_get(hdrs, "location");
-    apr_status_t rv = APR_SUCCESS;
-    
-    (void)acme;
-    (void)p;
-    if (location) {
-        ctx->authz = md_acme_authz_create(ctx->p);
-        ctx->authz->domain = apr_pstrdup(ctx->p, ctx->domain);
-        ctx->authz->url = apr_pstrdup(ctx->p, location);
-        ctx->authz->resource = md_json_clone(ctx->p, body);
-        md_log_perror(MD_LOG_MARK, MD_LOG_TRACE1, rv, ctx->p, "authz_new at %s", location);
-    }
-    else {
-        rv = APR_EINVAL;
-        md_log_perror(MD_LOG_MARK, MD_LOG_WARNING, rv, ctx->p, "new authz, no location header");
-    }
-    return rv;
-}
-
-apr_status_t md_acme_authz_register(struct md_acme_authz_t **pauthz, md_acme_t *acme, 
-                                    const char *domain, apr_pool_t *p)
-{
-    apr_status_t rv;
-    authz_req_ctx ctx;
-    
-    authz_req_ctx_init(&ctx, acme, domain, NULL, p);
-    
-    md_log_perror(MD_LOG_MARK, MD_LOG_DEBUG, 0, acme->p, "create new authz");
-    rv = md_acme_POST(acme, acme->api.v1.new_authz, on_init_authz, authz_created, NULL, NULL, &ctx);
-    
-    *pauthz = (APR_SUCCESS == rv)? ctx.authz : NULL;
-    return rv;
-}
-
 /**************************************************************************************************/
 /* Update an existing authorization */
 
@@ -244,17 +193,10 @@ static md_acme_authz_cha_t *cha_from_json(apr_pool_t *p, size_t index, md_json_t
 
 static apr_status_t on_init_authz_resp(md_acme_req_t *req, void *baton)
 {
-    authz_req_ctx *ctx = baton;
     md_json_t *jpayload;
 
+    (void)baton;
     jpayload = md_json_create(req->p);
-    if (MD_ACME_VERSION_MAJOR(req->acme->version) <= 1) {
-        md_json_sets(MD_KEY_CHALLENGE, jpayload, MD_KEY_RESOURCE, NULL);
-    }
-    if (ctx->challenge->key_authz) {
-        md_json_sets(ctx->challenge->key_authz, jpayload, MD_KEY_KEYAUTHZ, NULL);
-    }
-    
     return md_acme_req_body_init(req, jpayload);
 } 
 
@@ -298,19 +240,22 @@ static apr_status_t setup_key_authz(md_acme_authz_cha_t *cha, md_acme_authz_t *a
     return rv;
 }
 
-static apr_status_t cha_http_01_setup(md_acme_authz_cha_t *cha, md_acme_authz_t *authz, 
+static apr_status_t cha_http_01_setup(md_acme_authz_cha_t *cha, md_acme_authz_t *authz,
                                       md_acme_t *acme, md_store_t *store, 
-                                      md_pkey_spec_t *key_spec, 
-                                      apr_array_header_t *acme_tls_1_domains, 
-                                      apr_table_t *env, apr_pool_t *p)
+                                      md_pkeys_spec_t *key_specs,
+                                      apr_array_header_t *acme_tls_1_domains, const md_t *md,
+                                      apr_table_t *env, md_result_t *result,
+                                      const char **psetup_token, apr_pool_t *p)
 {
     const char *data;
     apr_status_t rv;
     int notify_server;
     
-    (void)key_spec;
+    (void)key_specs;
     (void)env;
     (void)acme_tls_1_domains;
+    (void)md;
+
     if (APR_SUCCESS != (rv = setup_key_authz(cha, authz, acme, p, &notify_server))) {
         goto out;
     }
@@ -318,14 +263,26 @@ static apr_status_t cha_http_01_setup(md_acme_authz_cha_t *cha, md_acme_authz_t 
     rv = md_store_load(store, MD_SG_CHALLENGES, authz->domain, MD_FN_HTTP01,
                        MD_SV_TEXT, (void**)&data, p);
     if ((APR_SUCCESS == rv && strcmp(cha->key_authz, data)) || APR_STATUS_IS_ENOENT(rv)) {
+        const char *content = apr_psprintf(p, "%s\n", cha->key_authz);
         rv = md_store_save(store, p, MD_SG_CHALLENGES, authz->domain, MD_FN_HTTP01,
-                           MD_SV_TEXT, (void*)cha->key_authz, 0);
+                           MD_SV_TEXT, (void*)content, 0);
         notify_server = 1;
     }
     
     if (APR_SUCCESS == rv && notify_server) {
         authz_req_ctx ctx;
+        const char *event;
 
+        /* Raise event that challenge data has been set up before we tell the
+           ACME server. Clusters might want to distribute it. */
+        event = apr_psprintf(p, "challenge-setup:%s:%s", MD_AUTHZ_TYPE_HTTP01, authz->domain);
+        rv = md_result_raise(result, event, p);
+        if (APR_SUCCESS != rv) {
+            md_log_perror(MD_LOG_MARK, MD_LOG_DEBUG, rv, p,
+                          "%s: event '%s' failed. aborting challenge setup",
+                          authz->domain, event);
+            goto out;
+        }
         /* challenge is setup or was changed from previous data, tell ACME server
          * so it may (re)try verification */        
         authz_req_ctx_init(&ctx, acme, NULL, authz, p);
@@ -333,75 +290,120 @@ static apr_status_t cha_http_01_setup(md_acme_authz_cha_t *cha, md_acme_authz_t 
         rv = md_acme_POST(acme, cha->uri, on_init_authz_resp, authz_http_set, NULL, NULL, &ctx);
     }
 out:
+    *psetup_token = (APR_SUCCESS == rv)?
+        apr_psprintf(p, "%s:%s", MD_AUTHZ_TYPE_HTTP01, authz->domain) : NULL;
     return rv;
+}
+
+void tls_alpn01_fnames(apr_pool_t *p, md_pkey_spec_t *kspec, char **keyfn, char **certfn )
+{
+    *keyfn  = apr_pstrcat(p, "acme-tls-alpn-01-", md_pkey_filename(kspec, p), NULL);
+    *certfn = apr_pstrcat(p, "acme-tls-alpn-01-", md_chain_filename(kspec, p), NULL);
 }
 
 static apr_status_t cha_tls_alpn_01_setup(md_acme_authz_cha_t *cha, md_acme_authz_t *authz, 
                                           md_acme_t *acme, md_store_t *store, 
-                                          md_pkey_spec_t *key_spec,  
-                                          apr_array_header_t *acme_tls_1_domains, 
-                                          apr_table_t *env, apr_pool_t *p)
+                                          md_pkeys_spec_t *key_specs,
+                                          apr_array_header_t *acme_tls_1_domains, const md_t *md,
+                                          apr_table_t *env, md_result_t *result,
+                                          const char **psetup_token, apr_pool_t *p)
 {
-    md_cert_t *cha_cert;
-    md_pkey_t *cha_key;
     const char *acme_id, *token;
     apr_status_t rv;
     int notify_server;
     md_data_t data;
-    
+    int i;
+
     (void)env;
+    (void)md;
     if (md_array_str_index(acme_tls_1_domains, authz->domain, 0, 0) < 0) {
         rv = APR_ENOTIMPL;
-        md_log_perror(MD_LOG_MARK, MD_LOG_DEBUG, rv, p, 
-                      "%s: protocol 'acme-tls/1' not enabled for this domain.", 
-                      authz->domain);
-        goto out;
+        if (acme_tls_1_domains->nelts) {
+            md_log_perror(MD_LOG_MARK, MD_LOG_DEBUG, 0, p,
+                          "%s: protocol 'acme-tls/1' seems not enabled for this domain, "
+                          "but is enabled for other associated domains. "
+                          "Continuing with fingers crossed.", authz->domain);
+        }
+        else {
+            md_log_perror(MD_LOG_MARK, MD_LOG_INFO, 0, p,
+                          "%s: protocol 'acme-tls/1' seems not enabled for this or "
+                          "any other associated domain. Not attempting challenge "
+                          "type tls-alpn-01.", authz->domain);
+            goto out;
+        }
     }
     if (APR_SUCCESS != (rv = setup_key_authz(cha, authz, acme, p, &notify_server))) {
         goto out;
     }
-    rv = md_store_load(store, MD_SG_CHALLENGES, authz->domain, MD_FN_TLSALPN01_CERT,
-                       MD_SV_CERT, (void**)&cha_cert, p);
-    if ((APR_SUCCESS == rv && !md_cert_covers_domain(cha_cert, authz->domain)) 
-        || APR_STATUS_IS_ENOENT(rv)) {
-        
-        if (APR_SUCCESS != (rv = md_pkey_gen(&cha_key, p, key_spec))) {
-            md_log_perror(MD_LOG_MARK, MD_LOG_ERR, rv, p, "%s: create tls-alpn-01 challenge key",
-                          authz->domain);
-            goto out;
-        }
 
-        /* Create a "tls-alpn-01" certificate for the domain we want to authenticate.
-         * The server will need to answer a TLS connection with SNI == authz->domain
-         * and ALPN procotol "acme-tls/1" with this certificate.
-         */
-        MD_DATA_SET_STR(&data, cha->key_authz);
-        rv = md_crypt_sha256_digest_hex(&token, p, &data);
-        if (APR_SUCCESS != rv) {
-            md_log_perror(MD_LOG_MARK, MD_LOG_ERR, rv, p, "%s: create tls-alpn-01 cert",
-                          authz->domain);
-            goto out;
-        }
+    /* Create a "tls-alpn-01" certificate for the domain we want to authenticate.
+     * The server will need to answer a TLS connection with SNI == authz->domain
+     * and ALPN protocol "acme-tls/1" with this certificate.
+     */
+    md_data_init_str(&data, cha->key_authz);
+    rv = md_crypt_sha256_digest_hex(&token, p, &data);
+    if (APR_SUCCESS != rv) {
+        md_log_perror(MD_LOG_MARK, MD_LOG_ERR, rv, p, "%s: create tls-alpn-01 validation token",
+                      authz->domain);
+        goto out;
+    }
+    acme_id = apr_psprintf(p, "critical,DER:04:20:%s", token);
+
+    /* Each configured key type must be generated to ensure:
+     * that any fallback certs already given to mod_ssl are replaced.
+     * We expect that the validation client (at the CA) can deal with at
+     * least one of them.
+     */
+
+    for (i = 0; i < md_pkeys_spec_count(key_specs); ++i) {
+        char *kfn, *cfn;
+        md_cert_t *cha_cert;
+        md_pkey_t *cha_key;
+        md_pkey_spec_t *key_spec;
+
+        key_spec = md_pkeys_spec_get(key_specs, i);
+        tls_alpn01_fnames(p, key_spec, &kfn, &cfn);
+
+        rv = md_store_load(store, MD_SG_CHALLENGES, authz->domain, cfn,
+                           MD_SV_CERT, (void**)&cha_cert, p);
+        if ((APR_SUCCESS == rv && !md_cert_covers_domain(cha_cert, authz->domain))
+            || APR_STATUS_IS_ENOENT(rv)) {
+            if (APR_SUCCESS != (rv = md_pkey_gen(&cha_key, p, key_spec))) {
+                md_log_perror(MD_LOG_MARK, MD_LOG_ERR, rv, p, "%s: create tls-alpn-01 %s challenge key",
+                              authz->domain, md_pkey_spec_name(key_spec));
+                goto out;
+            }
+
+            if (APR_SUCCESS != (rv = md_cert_make_tls_alpn_01(&cha_cert, authz->domain, acme_id, cha_key,
+                                                              apr_time_from_sec(7 * MD_SECS_PER_DAY), p))) {
+                md_log_perror(MD_LOG_MARK, MD_LOG_ERR, rv, p, "%s: create tls-alpn-01 %s challenge cert",
+                              authz->domain, md_pkey_spec_name(key_spec));
+                goto out;
+            }
         
-        acme_id = apr_psprintf(p, "critical,DER:04:20:%s", token);
-        if (APR_SUCCESS != (rv = md_cert_make_tls_alpn_01(&cha_cert, authz->domain, acme_id, cha_key, 
-                                            apr_time_from_sec(7 * MD_SECS_PER_DAY), p))) {
-            md_log_perror(MD_LOG_MARK, MD_LOG_ERR, rv, p, "%s: create tls-alpn-01 cert",
-                          authz->domain);
-            goto out;
+            if (APR_SUCCESS == (rv = md_store_save(store, p, MD_SG_CHALLENGES, authz->domain, kfn,
+                                                   MD_SV_PKEY, (void*)cha_key, 0))) {
+                rv = md_store_save(store, p, MD_SG_CHALLENGES, authz->domain, cfn,
+                                   MD_SV_CERT, (void*)cha_cert, 0);
+            }
+            ++notify_server;
         }
-        
-        if (APR_SUCCESS == (rv = md_store_save(store, p, MD_SG_CHALLENGES, authz->domain, MD_FN_TLSALPN01_PKEY,
-                                MD_SV_PKEY, (void*)cha_key, 0))) {
-            rv = md_store_save(store, p, MD_SG_CHALLENGES, authz->domain, MD_FN_TLSALPN01_CERT,
-                               MD_SV_CERT, (void*)cha_cert, 0);
-        }
-        notify_server = 1;
     }
     
     if (APR_SUCCESS == rv && notify_server) {
         authz_req_ctx ctx;
+        const char *event;
 
+        /* Raise event that challenge data has been set up before we tell the
+           ACME server. Clusters might want to distribute it. */
+        event = apr_psprintf(p, "challenge-setup:%s:%s", MD_AUTHZ_TYPE_TLSALPN01, authz->domain);
+        rv = md_result_raise(result, event, p);
+        if (APR_SUCCESS != rv) {
+            md_log_perror(MD_LOG_MARK, MD_LOG_DEBUG, rv, p,
+                          "%s: event '%s' failed. aborting challenge setup",
+                          authz->domain, event);
+            goto out;
+        }
         /* challenge is setup or was changed from previous data, tell ACME server
          * so it may (re)try verification */        
         authz_req_ctx_init(&ctx, acme, NULL, authz, p);
@@ -409,14 +411,17 @@ static apr_status_t cha_tls_alpn_01_setup(md_acme_authz_cha_t *cha, md_acme_auth
         rv = md_acme_POST(acme, cha->uri, on_init_authz_resp, authz_http_set, NULL, NULL, &ctx);
     }
 out:    
+    *psetup_token = (APR_SUCCESS == rv)?
+        apr_psprintf(p, "%s:%s", MD_AUTHZ_TYPE_TLSALPN01, authz->domain) : NULL;
     return rv;
 }
 
 static apr_status_t cha_dns_01_setup(md_acme_authz_cha_t *cha, md_acme_authz_t *authz, 
                                      md_acme_t *acme, md_store_t *store, 
-                                     md_pkey_spec_t *key_spec, 
-                                     apr_array_header_t *acme_tls_1_domains, 
-                                     apr_table_t *env, apr_pool_t *p)
+                                     md_pkeys_spec_t *key_specs,
+                                     apr_array_header_t *acme_tls_1_domains, const md_t *md,
+                                     apr_table_t *env, md_result_t *result,
+                                     const char **psetup_token, apr_pool_t *p)
 {
     const char *token;
     const char * const *argv;
@@ -425,12 +430,15 @@ static apr_status_t cha_dns_01_setup(md_acme_authz_cha_t *cha, md_acme_authz_t *
     int exit_code, notify_server;
     authz_req_ctx ctx;
     md_data_t data;
-    
+    const char *event;
+
     (void)store;
-    (void)key_spec;
+    (void)key_specs;
     (void)acme_tls_1_domains;
-    
-    dns01_cmd = apr_table_get(env, MD_KEY_CMD_DNS01);
+
+    dns01_cmd = md->dns01_cmd;
+    if (!dns01_cmd)
+      dns01_cmd = apr_table_get(env, MD_KEY_CMD_DNS01);
     if (!dns01_cmd) {
         rv = APR_ENOTIMPL;
         md_log_perror(MD_LOG_MARK, MD_LOG_DEBUG, rv, p, "%s: dns-01 command not set", 
@@ -442,82 +450,112 @@ static apr_status_t cha_dns_01_setup(md_acme_authz_cha_t *cha, md_acme_authz_t *
         goto out;
     }
     
-    MD_DATA_SET_STR(&data, cha->key_authz);
+    md_data_init_str(&data, cha->key_authz);
     rv = md_crypt_sha256_digest64(&token, p, &data);
     if (APR_SUCCESS != rv) {
-        md_log_perror(MD_LOG_MARK, MD_LOG_ERR, rv, p, "%s: create dns-01 token",
-                      authz->domain);
+        md_log_perror(MD_LOG_MARK, MD_LOG_ERR, rv, p, "%s: create dns-01 token for %s",
+                      md->name, authz->domain);
         goto out;
     }
 
     cmdline = apr_psprintf(p, "%s setup %s %s", dns01_cmd, authz->domain, token); 
     md_log_perror(MD_LOG_MARK, MD_LOG_DEBUG, 0, p, 
                   "%s: dns-01 setup command: %s", authz->domain, cmdline);
+
     apr_tokenize_to_argv(cmdline, (char***)&argv, p);
     if (APR_SUCCESS != (rv = md_util_exec(p, argv[0], argv, &exit_code))) {
         md_log_perror(MD_LOG_MARK, MD_LOG_WARNING, rv, p, 
-                      "%s: dns-01 setup command failed to execute", authz->domain);
+                      "%s: dns-01 setup command failed to execute for %s", md->name, authz->domain);
         goto out;
     }
     if (exit_code) {
         rv = APR_EGENERAL;
         md_log_perror(MD_LOG_MARK, MD_LOG_INFO, rv, p, 
-                      "%s: dns-01 setup command returns %d", authz->domain, exit_code);
+                      "%s: dns-01 setup command returns %d for %s", md->name, exit_code, authz->domain);
         goto out;
     }
     
-    /* challenge is setup, tell ACME server so it may (re)try verification */        
-    md_log_perror(MD_LOG_MARK, MD_LOG_DEBUG, rv, p, "%s: dns-01 setup succeeded", authz->domain);
+    /* Raise event that challenge data has been set up before we tell the
+       ACME server. Clusters might want to distribute it. */
+    event = apr_psprintf(p, "challenge-setup:%s:%s", MD_AUTHZ_TYPE_DNS01, authz->domain);
+    rv = md_result_raise(result, event, p);
+    if (APR_SUCCESS != rv) {
+        md_log_perror(MD_LOG_MARK, MD_LOG_DEBUG, rv, p,
+                      "%s: event '%s' failed. aborting challenge setup",
+                      authz->domain, event);
+        goto out;
+    }
+    /* challenge is setup, tell ACME server so it may (re)try verification */
+    md_log_perror(MD_LOG_MARK, MD_LOG_DEBUG, rv, p, "%s: dns-01 setup succeeded for %s",
+       md->name, authz->domain);
     authz_req_ctx_init(&ctx, acme, NULL, authz, p);
     ctx.challenge = cha;
     rv = md_acme_POST(acme, cha->uri, on_init_authz_resp, authz_http_set, NULL, NULL, &ctx);
     
 out:    
+    *psetup_token = (APR_SUCCESS == rv)?
+        apr_psprintf(p, "%s:%s %s", MD_AUTHZ_TYPE_DNS01, authz->domain, token) : NULL;
     return rv;
 }
 
-static apr_status_t cha_dns_01_teardown(md_store_t *store, const char *domain, 
+static apr_status_t cha_dns_01_teardown(md_store_t *store, const char *domain, const md_t *md,
                                         apr_table_t *env, apr_pool_t *p)
 {
     const char * const *argv;
-    const char *cmdline, *dns01_cmd;
+    const char *cmdline, *dns01_cmd, *dns01v;
+    char *tmp, *s;
     apr_status_t rv;
     int exit_code;
     
     (void)store;
-    
-    dns01_cmd = apr_table_get(env, MD_KEY_CMD_DNS01);
+
+    dns01_cmd = md->dns01_cmd;
+    if (!dns01_cmd)
+      dns01_cmd = apr_table_get(env, MD_KEY_CMD_DNS01);
     if (!dns01_cmd) {
         rv = APR_ENOTIMPL;
-        md_log_perror(MD_LOG_MARK, MD_LOG_DEBUG, 0, p, "%s: dns-01 command not set", domain);
+        md_log_perror(MD_LOG_MARK, MD_LOG_DEBUG, 0, p, "%s: dns-01 command not set for %s",
+            md->name, domain);
         goto out;
     }
-    
+    dns01v = apr_table_get(env, MD_KEY_DNS01_VERSION);
+    if (!dns01v || strcmp(dns01v, "2")) {
+        /* use older version of teardown args with only domain, remove token */
+        tmp = apr_pstrdup(p, domain);
+        s = strchr(tmp, ' ');
+        if (s) {
+            *s = '\0';
+            domain = tmp;
+        }
+    }
+
     cmdline = apr_psprintf(p, "%s teardown %s", dns01_cmd, domain); 
     apr_tokenize_to_argv(cmdline, (char***)&argv, p);
     if (APR_SUCCESS != (rv = md_util_exec(p, argv[0], argv, &exit_code)) || exit_code) {
         md_log_perror(MD_LOG_MARK, MD_LOG_WARNING, rv, p, 
-                      "%s: dns-01 teardown command failed (exit code=%d)",
-                      domain, exit_code);
+                      "%s: dns-01 teardown command failed (exit code=%d) for %s",
+                      md->name, exit_code, domain);
     }
 out:    
     return rv;
 }
 
-static apr_status_t cha_teardown_dir(md_store_t *store, const char *domain, 
+static apr_status_t cha_teardown_dir(md_store_t *store, const char *domain, const md_t *md,
                                      apr_table_t *env, apr_pool_t *p)
 {
+    (void)md;
     (void)env;
     return md_store_purge(store, p, MD_SG_CHALLENGES, domain);
 }
 
 typedef apr_status_t cha_setup(md_acme_authz_cha_t *cha, md_acme_authz_t *authz, 
                                md_acme_t *acme, md_store_t *store, 
-                               md_pkey_spec_t *key_spec, 
-                               apr_array_header_t *acme_tls_1_domains, 
-                               apr_table_t *env, apr_pool_t *p);
+                               md_pkeys_spec_t *key_specs,
+                               apr_array_header_t *acme_tls_1_domains, const md_t *md,
+                               apr_table_t *env, md_result_t *result,
+                               const char **psetup_token, apr_pool_t *p);
                                
-typedef apr_status_t cha_teardown(md_store_t *store, const char *domain, 
+typedef apr_status_t cha_teardown(md_store_t *store, const char *domain, const md_t *md,
                                   apr_table_t *env, apr_pool_t *p);
                                  
 typedef struct {
@@ -565,16 +603,15 @@ static apr_status_t find_type(void *baton, size_t index, md_json_t *json)
 }
 
 apr_status_t md_acme_authz_respond(md_acme_authz_t *authz, md_acme_t *acme, md_store_t *store, 
-                                   apr_array_header_t *challenges, md_pkey_spec_t *key_spec,
-                                   apr_array_header_t *acme_tls_1_domains, 
+                                   apr_array_header_t *challenges, md_pkeys_spec_t *key_specs,
+                                   apr_array_header_t *acme_tls_1_domains, const md_t *md,
                                    apr_table_t *env, apr_pool_t *p, const char **psetup_token,
                                    md_result_t *result)
 {
     apr_status_t rv;
-    int i;
+    int i, j;
     cha_find_ctx fctx;
-    const char *challenge_setup;
-    
+
     assert(acme);
     assert(authz);
     assert(authz->resource);
@@ -592,29 +629,37 @@ apr_status_t md_acme_authz_respond(md_acme_authz_t *authz, md_acme_t *acme, md_s
      * - if there was an overlap, but no setup was successful, report that. We
      *   will retry this, maybe the failure is temporary (e.g. command to setup DNS
      */
+     md_result_printf(result, 0, "%s: selecting suitable authorization challenge "
+                      "type, this domain supports %s",
+                      authz->domain, apr_array_pstrcat(p, challenges, ' '));
     rv = APR_ENOTIMPL;
-    challenge_setup = NULL;
-    for (i = 0; i < challenges->nelts && !fctx.accepted; ++i) {
+    *psetup_token = NULL;
+    for (i = 0; i < challenges->nelts; ++i) {
         fctx.type = APR_ARRAY_IDX(challenges, i, const char *);
+        fctx.accepted = NULL;
         md_json_itera(find_type, &fctx, authz->resource, MD_KEY_CHALLENGES, NULL);
+        md_log_perror(MD_LOG_MARK, MD_LOG_TRACE1, 0, p,
+                      "%s: challenge type '%s' for %s: %s",
+                      authz->domain, fctx.type, md->name,
+                      fctx.accepted? "maybe acceptable" : "not applicable");
 
         if (fctx.accepted) {
-            for (i = 0; i < (int)CHA_TYPES_LEN; ++i) {
-                if (!apr_strnatcasecmp(CHA_TYPES[i].name, fctx.accepted->type)) {
+            for (j = 0; j < (int)CHA_TYPES_LEN; ++j) {
+                if (!apr_strnatcasecmp(CHA_TYPES[j].name, fctx.accepted->type)) {
                     md_result_activity_printf(result, "Setting up challenge '%s' for domain %s", 
                                               fctx.accepted->type, authz->domain);
-                    rv = CHA_TYPES[i].setup(fctx.accepted, authz, acme, store, key_spec, 
-                                            acme_tls_1_domains, env, p);
+                    rv = CHA_TYPES[j].setup(fctx.accepted, authz, acme, store, key_specs,
+                                            acme_tls_1_domains, md, env, result,
+                                            psetup_token, p);
                     if (APR_SUCCESS == rv) {
                         md_log_perror(MD_LOG_MARK, MD_LOG_DEBUG, rv, p, 
-                                      "%s: set up challenge '%s'", 
-                                      authz->domain, fctx.accepted->type);
-                        challenge_setup = CHA_TYPES[i].name; 
+                                      "%s: set up challenge '%s' for %s", 
+                                      authz->domain, fctx.accepted->type, md->name);
                         goto out;
                     }
-                    md_result_printf(result, rv, "error setting up challenge '%s', "
+                    md_result_printf(result, rv, "error setting up challenge '%s' for %s, "
                                      "for domain %s, looking for other option",
-                                     fctx.accepted->type, authz->domain);
+                                     fctx.accepted->type, authz->domain, md->name);
                     md_result_log(result, MD_LOG_INFO);
                 }
             }
@@ -622,7 +667,6 @@ apr_status_t md_acme_authz_respond(md_acme_authz_t *authz, md_acme_t *acme, md_s
     }
     
 out:
-    *psetup_token = (APR_SUCCESS == rv)? apr_psprintf(p, "%s:%s", challenge_setup, authz->domain) : NULL;
     if (!fctx.accepted || APR_ENOTIMPL == rv) {
         rv = APR_EINVAL;
         fctx.offered = apr_array_make(p, 5, sizeof(const char*));
@@ -648,8 +692,8 @@ out:
     return rv;
 }
 
-apr_status_t md_acme_authz_teardown(struct md_store_t *store, 
-                                    const char *token, apr_table_t *env, apr_pool_t *p)
+apr_status_t md_acme_authz_teardown(struct md_store_t *store, const char *token,
+                                    const md_t *md, apr_table_t *env, apr_pool_t *p)
 {
     char *challenge, *domain;
     int i;
@@ -661,7 +705,7 @@ apr_status_t md_acme_authz_teardown(struct md_store_t *store,
         for (i = 0; i < (int)CHA_TYPES_LEN; ++i) {
             if (!apr_strnatcasecmp(CHA_TYPES[i].name, challenge)) {
                 if (CHA_TYPES[i].teardown) {
-                    return CHA_TYPES[i].teardown(store, domain, env, p);
+                    return CHA_TYPES[i].teardown(store, domain, md, env, p);
                 }
                 break;
             }

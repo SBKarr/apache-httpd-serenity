@@ -97,6 +97,7 @@ struct md_acme_t {
     apr_pool_t *p;
     const char *user_agent;
     const char *proxy_url;
+    const char *ca_file;
     
     const char *acct_id;            /* local storage id account was loaded from or NULL */
     struct md_acme_acct_t *acct;    /* account at ACME server to use for requests */
@@ -104,7 +105,7 @@ struct md_acme_t {
     
     int version;                    /* as detected from the server */
     union {
-        struct {
+        struct { /* obsolete */
             const char *new_authz;
             const char *new_cert;
             const char *new_reg;
@@ -121,6 +122,7 @@ struct md_acme_t {
     } api;
     const char *ca_agreement;
     const char *acct_name;
+    int eab_required;
     
     md_acme_new_nonce_fn *new_nonce_fn;
     md_acme_req_init_fn *req_init_fn;
@@ -149,7 +151,7 @@ apr_status_t md_acme_init(apr_pool_t *pool, const char *base_version, int init_s
  * @param proxy_url optional url of a HTTP(S) proxy to use
  */
 apr_status_t md_acme_create(md_acme_t **pacme, apr_pool_t *p, const char *url,
-                            const char *proxy_url);
+                            const char *proxy_url, const char *ca_file);
 
 /**
  * Contact the ACME server and retrieve its directory information.
@@ -184,10 +186,27 @@ const char *md_acme_acct_url_get(md_acme_t *acme);
 
 /** 
  * Specify the account to use by name in local store. On success, the account
- * the "current" one used by the acme instance.
+ * is the "current" one used by the acme instance.
+ * @param acme the acme instance to set the account for
+ * @param store the store to load accounts from
+ * @param p pool for allocations
+ * @param acct_id name of the account to load
  */
 apr_status_t md_acme_use_acct(md_acme_t *acme, struct md_store_t *store, 
                               apr_pool_t *p, const char *acct_id);
+
+/**
+ * Specify the account to use for a specific MD by name in local store.
+ * On success, the account is the "current" one used by the acme instance.
+ * @param acme the acme instance to set the account for
+ * @param store the store to load accounts from
+ * @param p pool for allocations
+ * @param acct_id name of the account to load
+ * @param md the MD the account shall be used for
+ */
+apr_status_t md_acme_use_acct_for_md(md_acme_t *acme, struct md_store_t *store,
+                                     apr_pool_t *p, const char *acct_id,
+                                     const md_t *md);
 
 /**
  * Get the local name of the account currently used by the acme instance.
@@ -231,7 +250,7 @@ struct md_acme_req_t {
     
     const char *url;               /* url to POST the request to */
     const char *method;            /* HTTP method to use */
-    apr_table_t *prot_hdrs;        /* JWS headers needing protection (nonce) */
+    struct md_json_t *prot_fields; /* JWS protected fields */
     struct md_json_t *req_json;    /* JSON to be POSTed in request body */
 
     apr_table_t *resp_hdrs;        /* HTTP response headers */
@@ -287,5 +306,12 @@ apr_status_t md_acme_get_json(struct md_json_t **pjson, md_acme_t *acme,
 apr_status_t md_acme_req_body_init(md_acme_req_t *req, struct md_json_t *jpayload);
 
 apr_status_t md_acme_protos_add(struct apr_hash_t *protos, apr_pool_t *p);
+
+/**
+ * Return != 0 iff the given problem identifier is an ACME error string
+ * indicating something is wrong with the input values, e.g. from our
+ * configuration.
+ */
+int md_acme_problem_is_input_related(const char *problem);
 
 #endif /* md_acme_h */

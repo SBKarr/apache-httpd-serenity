@@ -214,28 +214,33 @@ fi
 
 AC_ARG_WITH(pcre,
 APACHE_HELP_STRING(--with-pcre=PATH,Use external PCRE library))
-
-AC_PATH_PROG(PCRE_CONFIG, pcre-config, false)
-if test -d "$with_pcre" && test -x "$with_pcre/bin/pcre-config"; then
-   PCRE_CONFIG=$with_pcre/bin/pcre-config
-elif test -x "$with_pcre"; then
-   PCRE_CONFIG=$with_pcre
+if test "x$with_pcre" = "x" || test "$with_pcre" = "yes"; then
+  with_pcre="$PATH"
+else if which $with_pcre 2>/dev/null; then :; else
+  with_pcre="$with_pcre/bin:$with_pcre"
+fi
 fi
 
-if test "$PCRE_CONFIG" != "false"; then
+AC_CHECK_TARGET_TOOLS(PCRE_CONFIG, [pcre2-config pcre-config],
+                      [`which $with_pcre 2>/dev/null`], $with_pcre)
+
+if test "x$PCRE_CONFIG" != "x"; then
   if $PCRE_CONFIG --version >/dev/null 2>&1; then :; else
-    AC_MSG_ERROR([Did not find pcre-config script at $PCRE_CONFIG])
+    AC_MSG_ERROR([Did not find working script at $PCRE_CONFIG])
   fi
   case `$PCRE_CONFIG --version` in
+  [1[0-9].*])
+    AC_DEFINE(HAVE_PCRE2, 1, [Detected PCRE2]) 
+    ;;
   [[1-5].*])
     AC_MSG_ERROR([Need at least pcre version 6.0])
     ;;
   esac
   AC_MSG_NOTICE([Using external PCRE library from $PCRE_CONFIG])
   APR_ADDTO(PCRE_INCLUDES, [`$PCRE_CONFIG --cflags`])
-  APR_ADDTO(PCRE_LIBS, [`$PCRE_CONFIG --libs`])
+  APR_ADDTO(PCRE_LIBS, [`$PCRE_CONFIG --libs8 2>/dev/null || $PCRE_CONFIG --libs`])
 else
-  AC_MSG_ERROR([pcre-config for libpcre not found. PCRE is required and available from http://pcre.org/])
+  AC_MSG_ERROR([pcre(2)-config for libpcre not found. PCRE is required and available from http://pcre.org/])
 fi
 APACHE_SUBST(PCRE_LIBS)
 
@@ -262,6 +267,24 @@ APR_ADDTO(INCLUDES, $APU_INCLUDES)
 
 dnl Add in path to PCRE includes
 APR_ADDTO(INCLUDES, $PCRE_INCLUDES)
+
+save_CPPFLAGS="$CPPFLAGS"
+CPPFLAGS="$CPPFLAGS $PCRE_INCLUDES"
+AC_EGREP_CPP(yes,
+[
+#ifdef HAVE_PCRE2
+yes
+#else
+#include <pcre.h>
+#ifdef PCRE_DUPNAMES
+yes
+#endif
+#endif
+],pcre_have_dupnames=yes,pcre_have_dupnames=no)
+if test "$pcre_have_dupnames" != "yes"; then
+    AC_MSG_ERROR([pcre version does not support PCRE_DUPNAMES])
+fi
+CPPFLAGS="$save_CPPFLAGS"
 
 AC_MSG_NOTICE([])
 AC_MSG_NOTICE([Applying OS-specific hints for httpd...])
@@ -372,6 +395,7 @@ dnl ## Check for programs
 AC_PATH_PROG(RM, rm)
 AC_PATH_PROG(PKGCONFIG, pkg-config)
 AC_PATH_PROG(RSYNC, rsync)
+AC_PATH_PROG(SVN, svn)
 AC_PROG_AWK
 AC_PROG_LN_S
 AC_CHECK_TOOL(RANLIB, ranlib, true)
@@ -464,6 +488,28 @@ LIBS=""
 AC_SEARCH_LIBS(crypt, crypt)
 CRYPT_LIBS="$LIBS"
 APACHE_SUBST(CRYPT_LIBS)
+
+if test "$ac_cv_search_crypt" != "no"; then
+   # Test crypt() with the SHA-512 test vector from https://akkadia.org/drepper/SHA-crypt.txt
+   AC_CACHE_CHECK([whether crypt() supports SHA-2], [ap_cv_crypt_sha2], [
+    AC_RUN_IFELSE([AC_LANG_PROGRAM([[
+#include <crypt.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define PASSWD_0 "Hello world!"
+#define SALT_0 "\$6\$saltstring"
+#define EXPECT_0 "\$6\$saltstring\$svn8UoSVapNtMuq1ukKS4tPQd8iKwSMHWjl/O817G3uBnIFNjnQJu" \
+               "esI68u4OTLiBFdcbYEdFCoEOfaS35inz1"
+]], [char *result = crypt(PASSWD_0, SALT_0);
+     if (!result) return 1;
+     if (strcmp(result, EXPECT_0)) return 2;
+])], [ap_cv_crypt_sha2=yes], [ap_cv_crypt_sha2=no], [ap_cv_crypt_sha2=no])])
+   if test "$ap_cv_crypt_sha2" = yes; then
+     AC_DEFINE([HAVE_CRYPT_SHA2], 1, [Define if crypt() supports SHA-2 hashes])
+   fi
+fi
+
 LIBS="$saved_LIBS"
 
 dnl See Comment #Spoon
@@ -477,23 +523,33 @@ prctl \
 timegm \
 getpgid \
 fopen64 \
-getloadavg
+getloadavg \
+gettid
 )
 
 dnl confirm that a void pointer is large enough to store a long integer
 APACHE_CHECK_VOID_PTR_LEN
 
-AC_CACHE_CHECK([for gettid()], ac_cv_gettid,
+if test $ac_cv_func_gettid = no; then
+  # On Linux before glibc 2.30, gettid() is only usable via syscall()
+  AC_CACHE_CHECK([for gettid() via syscall], ap_cv_gettid,
 [AC_TRY_RUN(#define _GNU_SOURCE
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 int main(int argc, char **argv) {
 pid_t t = syscall(SYS_gettid); return t == -1 ? 1 : 0; },
-[ac_cv_gettid=yes], [ac_cv_gettid=no], [ac_cv_gettid=no])])
-if test "$ac_cv_gettid" = "yes"; then
-    AC_DEFINE(HAVE_GETTID, 1, [Define if you have gettid()])
+  [ap_cv_gettid=yes], [ap_cv_gettid=no], [ap_cv_gettid=no])])
+  if test "$ap_cv_gettid" = "yes"; then
+      AC_DEFINE(HAVE_SYS_GETTID, 1, [Define if you have gettid() via syscall()])
+  fi
 fi
+
+case ${host}X${ac_cv_func_gettid}X${ap_cv_gettid} in
+*linux-*XyesX* | *linux-*XnoXyes)
+     AC_DEFINE(DEFAULT_LOG_TID, ["g"], [Define as default argument for thread id in error logging])
+     ;;
+esac
 
 dnl ## Check for the tm_gmtoff field in struct tm to get the timezone diffs
 AC_CACHE_CHECK([for tm_gmtoff in struct tm], ac_cv_struct_tm_gmtoff,
@@ -609,7 +665,7 @@ AC_ARG_ENABLE(maintainer-mode,APACHE_HELP_STRING(--enable-maintainer-mode,Turn o
       APACHE_ADD_GCC_CFLAG([-Wformat-security])
       APACHE_ADD_GCC_CFLAG([-Wunused])
     elif test "$AIX_XLC" = "yes"; then
-      APR_ADDTO(NOTEST_CFLAGS,-qfullpath -qinitauto=FE -qcheck=all -qinfo=pro)
+      APR_ADDTO(NOTEST_CFLAGS,-qfullpath -qcheck=all -qinfo=pro)
     fi
     if test "x$enable_load_all_modules" = "x"; then
       LOAD_ALL_MODULES=yes
@@ -841,6 +897,11 @@ APACHE_FAST_OUTPUT(support/Makefile)
 
 if test -d ./test; then
     APACHE_FAST_OUTPUT(test/Makefile)
+fi
+if test -d ./test/modules/http2; then
+    APACHE_FAST_OUTPUT(test/Makefile)
+    AC_CONFIG_FILES([test/pyhttpd/config.ini])
+    APACHE_FAST_OUTPUT(test/clients/Makefile)
 fi
 
 dnl ## Finalize the variables

@@ -464,29 +464,52 @@ BOOL modssl_X509_match_name(apr_pool_t *p, X509 *x509, const char *name,
 **  _________________________________________________________________
 */
 
-DH *ssl_dh_GetParamFromFile(const char *file)
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+DH *modssl_dh_from_file(const char *file)
 {
-    DH *dh = NULL;
+    DH *dh;
     BIO *bio;
 
     if ((bio = BIO_new_file(file, "r")) == NULL)
         return NULL;
     dh = PEM_read_bio_DHparams(bio, NULL, NULL, NULL);
     BIO_free(bio);
-    return (dh);
-}
 
-#ifdef HAVE_ECC
-EC_GROUP *ssl_ec_GetParamFromFile(const char *file)
+    return dh;
+}
+#else
+EVP_PKEY *modssl_dh_pkey_from_file(const char *file)
 {
-    EC_GROUP *group = NULL;
+    EVP_PKEY *pkey;
     BIO *bio;
 
     if ((bio = BIO_new_file(file, "r")) == NULL)
         return NULL;
-    group = PEM_read_bio_ECPKParameters(bio, NULL, NULL, NULL);
+    pkey = PEM_read_bio_Parameters(bio, NULL);
     BIO_free(bio);
-    return (group);
+
+    return pkey;
+}
+#endif
+
+#ifdef HAVE_ECC
+EC_GROUP *modssl_ec_group_from_file(const char *file)
+{
+    EC_GROUP *group;
+    BIO *bio;
+
+    if ((bio = BIO_new_file(file, "r")) == NULL)
+        return NULL;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    group = PEM_read_bio_ECPKParameters(bio, NULL, NULL, NULL);
+#else
+    group = PEM_ASN1_read_bio((void *)d2i_ECPKParameters,
+                              PEM_STRING_ECPARAMETERS, bio,
+                              NULL, NULL, NULL);
+#endif
+    BIO_free(bio);
+
+    return group;
 }
 #endif
 
@@ -510,4 +533,98 @@ char *modssl_SSL_SESSION_id2sz(IDCONST unsigned char *id, int idlen,
     ap_bin2hex(id, idlen, str);
 
     return str;
+}
+
+/*  _________________________________________________________________
+**
+**  Certificate/Key Stuff
+**  _________________________________________________________________
+*/
+
+apr_status_t modssl_read_cert(apr_pool_t *p, 
+                              const char *cert_pem, const char *key_pem,
+                              pem_password_cb *cb, void *ud,
+                              X509 **pcert, EVP_PKEY **pkey)
+{
+    BIO *in;
+    X509 *x = NULL;
+    EVP_PKEY *key = NULL;
+    apr_status_t rv = APR_SUCCESS;
+
+    in = BIO_new_mem_buf(cert_pem, -1);
+    if (in == NULL) {
+        rv = APR_ENOMEM;
+        goto cleanup;
+    }
+    
+    x = PEM_read_bio_X509(in, NULL, cb, ud);
+    if (x == NULL) {
+        rv = APR_ENOENT;
+        goto cleanup;
+    }
+    
+    BIO_free(in);
+    in = BIO_new_mem_buf(key_pem? key_pem : cert_pem, -1);
+    if (in == NULL) {
+        rv = APR_ENOMEM;
+        goto cleanup;
+    }
+    key = PEM_read_bio_PrivateKey(in, NULL, cb, ud);
+    if (key == NULL) {
+        rv = APR_ENOENT;
+        goto cleanup;
+    }
+    
+cleanup:
+    if (rv == APR_SUCCESS) {
+        *pcert = x;
+        *pkey = key;
+    }
+    else {
+        *pcert = NULL;
+        *pkey = NULL;
+        if (x) X509_free(x);
+        if (key) EVP_PKEY_free(key);
+    }
+    if (in != NULL) BIO_free(in);
+    return rv;
+}
+
+apr_status_t modssl_cert_get_pem(apr_pool_t *p,
+                                 X509 *cert1, X509 *cert2,
+                                 const char **ppem)
+{
+    apr_status_t rv = APR_ENOMEM;
+    BIO *bio;
+
+    if ((bio = BIO_new(BIO_s_mem())) == NULL) goto cleanup;
+    if (PEM_write_bio_X509(bio, cert1) != 1) goto cleanup;
+    if (cert2 && PEM_write_bio_X509(bio, cert2) != 1) goto cleanup;
+    rv = APR_SUCCESS;
+
+cleanup:
+    if (rv != APR_SUCCESS) {
+        *ppem = NULL;
+        if (bio) BIO_free(bio);
+    }
+    else {
+        *ppem = modssl_bio_free_read(p, bio);
+    }
+    return rv;
+}
+
+void modssl_set_reneg_state(SSLConnRec *sslconn, modssl_reneg_state state)
+{
+#ifdef SSL_OP_NO_RENEGOTIATION
+    switch (state) {
+    case RENEG_ALLOW:
+        SSL_clear_options(sslconn->ssl, SSL_OP_NO_RENEGOTIATION);
+        break;
+    default:
+        SSL_set_options(sslconn->ssl, SSL_OP_NO_RENEGOTIATION);
+        break;
+    }
+#else
+    sslconn->reneg_state = state;
+#endif
 }

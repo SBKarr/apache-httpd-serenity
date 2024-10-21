@@ -75,17 +75,6 @@
  */
 #include "test_char.h"
 
-/* Win32/NetWare/OS2 need to check for both forward and back slashes
- * in ap_getparents() and ap_escape_url.
- */
-#ifdef CASE_BLIND_FILESYSTEM
-#define IS_SLASH(s) ((s == '/') || (s == '\\'))
-#define SLASHES "/\\"
-#else
-#define IS_SLASH(s) (s == '/')
-#define SLASHES "/"
-#endif
-
 /* we know core's module_index is 0 */
 #undef APLOG_MODULE_INDEX
 #define APLOG_MODULE_INDEX AP_CORE_MODULE_INDEX
@@ -185,11 +174,9 @@ AP_DECLARE(char *) ap_ht_time(apr_pool_t *p, apr_time_t t, const char *fmt,
  */
 AP_DECLARE(int) ap_strcmp_match(const char *str, const char *expected)
 {
-    int x, y;
+    apr_size_t x, y;
 
     for (x = 0, y = 0; expected[y]; ++y, ++x) {
-        if ((!str[x]) && (expected[y] != '*'))
-            return -1;
         if (expected[y] == '*') {
             while (expected[++y] == '*');
             if (!expected[y])
@@ -201,6 +188,8 @@ AP_DECLARE(int) ap_strcmp_match(const char *str, const char *expected)
             }
             return -1;
         }
+        else if (!str[x])
+            return -1;
         else if ((expected[y] != '?') && (str[x] != expected[y]))
             return 1;
     }
@@ -209,7 +198,7 @@ AP_DECLARE(int) ap_strcmp_match(const char *str, const char *expected)
 
 AP_DECLARE(int) ap_strcasecmp_match(const char *str, const char *expected)
 {
-    int x, y;
+    apr_size_t x, y;
 
     for (x = 0, y = 0; expected[y]; ++y, ++x) {
         if (!str[x] && expected[y] != '*')
@@ -250,10 +239,8 @@ AP_DECLARE(int) ap_os_is_path_absolute(apr_pool_t *p, const char *dir)
 
 AP_DECLARE(int) ap_is_matchexp(const char *str)
 {
-    int x;
-
-    for (x = 0; str[x]; x++)
-        if ((str[x] == '*') || (str[x] == '?'))
+    for (; *str; str++)
+        if ((*str == '*') || (*str == '?'))
             return 1;
     return 0;
 }
@@ -491,75 +478,135 @@ AP_DECLARE(apr_status_t) ap_pregsub_ex(apr_pool_t *p, char **result,
     return rc;
 }
 
+/* Forward declare */
+static char x2c(const char *what);
+
+#define IS_SLASH_OR_NUL(s) (s == '\0' || AP_IS_SLASH(s))
+
+/*
+ * Inspired by mod_jk's jk_servlet_normalize().
+ */
+AP_DECLARE(int) ap_normalize_path(char *path, unsigned int flags)
+{
+    int ret = 1;
+    apr_size_t l = 1, w = 1, n;
+    int decode_unreserved = (flags & AP_NORMALIZE_DECODE_UNRESERVED) != 0;
+    int merge_slashes = (flags & AP_NORMALIZE_MERGE_SLASHES) != 0;
+
+    if (!AP_IS_SLASH(path[0])) {
+        /* Besides "OPTIONS *", a request-target should start with '/'
+         * per RFC 7230 section 5.3, so anything else is invalid.
+         */
+        if (path[0] == '*' && path[1] == '\0') {
+            return 1;
+        }
+        /* However, AP_NORMALIZE_ALLOW_RELATIVE can be used to bypass
+         * this restriction (e.g. for subrequest file lookups).
+         */
+        if (!(flags & AP_NORMALIZE_ALLOW_RELATIVE) || path[0] == '\0') {
+            return 0;
+        }
+
+        l = w = 0;
+    }
+
+    while (path[l] != '\0') {
+        /* RFC-3986 section 2.3:
+         *  For consistency, percent-encoded octets in the ranges of
+         *  ALPHA (%41-%5A and %61-%7A), DIGIT (%30-%39), hyphen (%2D),
+         *  period (%2E), underscore (%5F), or tilde (%7E) should [...]
+         *  be decoded to their corresponding unreserved characters by
+         *  URI normalizers.
+         */
+        if (decode_unreserved && path[l] == '%') {
+            if (apr_isxdigit(path[l + 1]) && apr_isxdigit(path[l + 2])) {
+                const char c = x2c(&path[l + 1]);
+                if (TEST_CHAR(c, T_URI_UNRESERVED)) {
+                    /* Replace last char and fall through as the current
+                     * read position */
+                    l += 2;
+                    path[l] = c;
+                }
+            }
+            else {
+                /* Invalid encoding */
+                ret = 0;
+            }
+        }
+
+        if (w == 0 || AP_IS_SLASH(path[w - 1])) {
+            /* Collapse ///// sequences to / */
+            if (merge_slashes && AP_IS_SLASH(path[l])) {
+                do {
+                    l++;
+                } while (AP_IS_SLASH(path[l]));
+                continue;
+            }
+
+            if (path[l] == '.') {
+                /* Remove /./ segments */
+                if (IS_SLASH_OR_NUL(path[l + 1])) {
+                    l++;
+                    if (path[l]) {
+                        l++;
+                    }
+                    continue;
+                }
+
+                /* Remove /xx/../ segments (or /xx/.%2e/ when
+                 * AP_NORMALIZE_DECODE_UNRESERVED is set since we
+                 * decoded only the first dot above).
+                 */
+                n = l + 1;
+                if ((path[n] == '.' || (decode_unreserved
+                                        && path[n] == '%'
+                                        && path[++n] == '2'
+                                        && (path[++n] == 'e'
+                                            || path[n] == 'E')))
+                        && IS_SLASH_OR_NUL(path[n + 1])) {
+                    /* Wind w back to remove the previous segment */
+                    if (w > 1) {
+                        do {
+                            w--;
+                        } while (w && !AP_IS_SLASH(path[w - 1]));
+                    }
+                    else {
+                        /* Already at root, ignore and return a failure
+                         * if asked to.
+                         */
+                        if (flags & AP_NORMALIZE_NOT_ABOVE_ROOT) {
+                            ret = 0;
+                        }
+                    }
+
+                    /* Move l forward to the next segment */
+                    l = n + 1;
+                    if (path[l]) {
+                        l++;
+                    }
+                    continue;
+                }
+            }
+        }
+
+        path[w++] = path[l++];
+    }
+    path[w] = '\0';
+
+    return ret;
+}
+
 /*
  * Parse .. so we don't compromise security
  */
 AP_DECLARE(void) ap_getparents(char *name)
 {
-    char *next;
-    int l, w, first_dot;
-
-    /* Four paseses, as per RFC 1808 */
-    /* a) remove ./ path segments */
-    for (next = name; *next && (*next != '.'); next++) {
-    }
-
-    l = w = first_dot = next - name;
-    while (name[l] != '\0') {
-        if (name[l] == '.' && IS_SLASH(name[l + 1])
-            && (l == 0 || IS_SLASH(name[l - 1])))
-            l += 2;
-        else
-            name[w++] = name[l++];
-    }
-
-    /* b) remove trailing . path, segment */
-    if (w == 1 && name[0] == '.')
-        w--;
-    else if (w > 1 && name[w - 1] == '.' && IS_SLASH(name[w - 2]))
-        w--;
-    name[w] = '\0';
-
-    /* c) remove all xx/../ segments. (including leading ../ and /../) */
-    l = first_dot;
-
-    while (name[l] != '\0') {
-        if (name[l] == '.' && name[l + 1] == '.' && IS_SLASH(name[l + 2])
-            && (l == 0 || IS_SLASH(name[l - 1]))) {
-            int m = l + 3, n;
-
-            l = l - 2;
-            if (l >= 0) {
-                while (l >= 0 && !IS_SLASH(name[l]))
-                    l--;
-                l++;
-            }
-            else
-                l = 0;
-            n = l;
-            while ((name[n] = name[m]))
-                (++n, ++m);
-        }
-        else
-            ++l;
-    }
-
-    /* d) remove trailing xx/.. segment. */
-    if (l == 2 && name[0] == '.' && name[1] == '.')
+    if (!ap_normalize_path(name, AP_NORMALIZE_NOT_ABOVE_ROOT |
+                                 AP_NORMALIZE_ALLOW_RELATIVE)) {
         name[0] = '\0';
-    else if (l > 2 && name[l - 1] == '.' && name[l - 2] == '.'
-             && IS_SLASH(name[l - 3])) {
-        l = l - 4;
-        if (l >= 0) {
-            while (l >= 0 && !IS_SLASH(name[l]))
-                l--;
-            l++;
-        }
-        else
-            l = 0;
-        name[l] = '\0';
     }
 }
+
 AP_DECLARE(void) ap_no2slash_ex(char *name, int is_fs_path)
 {
 
@@ -941,7 +988,7 @@ AP_DECLARE(apr_status_t) ap_pcfg_openfile(ap_configfile_t **ret_cfg,
 
     if (finfo.filetype != APR_REG &&
 #if defined(WIN32) || defined(OS2) || defined(NETWARE)
-        strcasecmp(apr_filepath_name_get(name), "nul") != 0) {
+        ap_cstr_casecmp(apr_filepath_name_get(name), "nul") != 0) {
 #else
         strcmp(name, "/dev/null") != 0) {
 #endif /* WIN32 || OS2 */
@@ -1698,7 +1745,7 @@ AP_DECLARE(int) ap_find_token(apr_pool_t *p, const char *line, const char *tok)
         while (*s && !TEST_CHAR(*s, T_HTTP_TOKEN_STOP)) {
             ++s;
         }
-        if (!strncasecmp((const char *)start_token, (const char *)tok,
+        if (!ap_cstr_casecmpn((const char *)start_token, (const char *)tok,
                          s - start_token)) {
             return 1;
         }
@@ -1827,8 +1874,12 @@ static char x2c(const char *what)
  *   decoding %00 or a forbidden character returns HTTP_NOT_FOUND
  */
 
-static int unescape_url(char *url, const char *forbid, const char *reserved)
+static int unescape_url(char *url, const char *forbid, const char *reserved,
+                        unsigned int flags)
 {
+    const int keep_slashes = (flags & AP_UNESCAPE_URL_KEEP_SLASHES) != 0,
+              forbid_slashes = (flags & AP_UNESCAPE_URL_FORBID_SLASHES) != 0,
+              keep_unreserved = (flags & AP_UNESCAPE_URL_KEEP_UNRESERVED) != 0;
     int badesc, badpath;
     char *x, *y;
 
@@ -1853,12 +1904,16 @@ static int unescape_url(char *url, const char *forbid, const char *reserved)
                 char decoded;
                 decoded = x2c(y + 1);
                 if ((decoded == '\0')
+                    || (forbid_slashes && AP_IS_SLASH(decoded))
                     || (forbid && ap_strchr_c(forbid, decoded))) {
                     badpath = 1;
                     *x = decoded;
                     y += 2;
                 }
-                else if (reserved && ap_strchr_c(reserved, decoded)) {
+                else if ((keep_unreserved && TEST_CHAR(decoded,
+                                                       T_URI_UNRESERVED))
+                         || (keep_slashes && AP_IS_SLASH(decoded))
+                         || (reserved && ap_strchr_c(reserved, decoded))) {
                     *x++ = *y++;
                     *x++ = *y++;
                     *x = *y;
@@ -1884,19 +1939,24 @@ static int unescape_url(char *url, const char *forbid, const char *reserved)
 AP_DECLARE(int) ap_unescape_url(char *url)
 {
     /* Traditional */
-    return unescape_url(url, SLASHES, NULL);
+    return unescape_url(url, AP_SLASHES, NULL, 0);
 }
 AP_DECLARE(int) ap_unescape_url_keep2f(char *url, int decode_slashes)
 {
     /* AllowEncodedSlashes (corrected) */
     if (decode_slashes) {
         /* no chars reserved */
-        return unescape_url(url, NULL, NULL);
+        return unescape_url(url, NULL, NULL, 0);
     } else {
         /* reserve (do not decode) encoded slashes */
-        return unescape_url(url, NULL, SLASHES);
+        return unescape_url(url, NULL, AP_SLASHES, 0);
     }
 }
+AP_DECLARE(int) ap_unescape_url_ex(char *url, unsigned int flags)
+{
+    return unescape_url(url, NULL, NULL, flags);
+}
+
 #ifdef NEW_APIS
 /* IFDEF these out until they've been thought through.
  * Just a germ of an API extension for now
@@ -1906,7 +1966,7 @@ AP_DECLARE(int) ap_unescape_url_proxy(char *url)
     /* leave RFC1738 reserved characters intact, * so proxied URLs
      * don't get mangled.  Where does that leave encoded '&' ?
      */
-    return unescape_url(url, NULL, "/;?");
+    return unescape_url(url, NULL, "/;?", 0);
 }
 AP_DECLARE(int) ap_unescape_url_reserved(char *url, const char *reserved)
 {
@@ -1928,7 +1988,7 @@ AP_DECLARE(int) ap_unescape_urlencoded(char *query)
     }
 
     /* unescape everything else */
-    return unescape_url(query, NULL, NULL);
+    return unescape_url(query, NULL, NULL, 0);
 }
 
 AP_DECLARE(char *) ap_construct_server(apr_pool_t *p, const char *hostname,
@@ -1944,7 +2004,7 @@ AP_DECLARE(char *) ap_construct_server(apr_pool_t *p, const char *hostname,
 
 AP_DECLARE(int) ap_unescape_all(char *url)
 {
-    return unescape_url(url, NULL, NULL);
+    return unescape_url(url, NULL, NULL, 0);
 }
 
 /* c2x takes an unsigned, and expects the caller has guaranteed that
@@ -2070,11 +2130,14 @@ AP_DECLARE(char *) ap_escape_urlencoded(apr_pool_t *p, const char *buffer)
 
 AP_DECLARE(char *) ap_escape_html2(apr_pool_t *p, const char *s, int toasc)
 {
-    int i, j;
+    apr_size_t i, j;
     char *x;
 
     /* first, count the number of extra characters */
-    for (i = 0, j = 0; s[i] != '\0'; i++)
+    for (i = 0, j = 0; s[i] != '\0'; i++) {
+        if (i + j > APR_SIZE_MAX - 6) {
+            abort();
+        }
         if (s[i] == '<' || s[i] == '>')
             j += 3;
         else if (s[i] == '&')
@@ -2083,6 +2146,7 @@ AP_DECLARE(char *) ap_escape_html2(apr_pool_t *p, const char *s, int toasc)
             j += 5;
         else if (toasc && !apr_isascii(s[i]))
             j += 5;
+    }
 
     if (j == 0)
         return apr_pstrmemdup(p, s, i);
@@ -2413,11 +2477,9 @@ char *ap_get_local_host(apr_pool_t *a)
 AP_DECLARE(char *) ap_pbase64decode(apr_pool_t *p, const char *bufcoded)
 {
     char *decoded;
-    int l;
 
-    decoded = (char *) apr_palloc(p, 1 + apr_base64_decode_len(bufcoded));
-    l = apr_base64_decode(decoded, bufcoded);
-    decoded[l] = '\0'; /* make binary sequence into string */
+    decoded = (char *) apr_palloc(p, apr_base64_decode_len(bufcoded));
+    apr_base64_decode(decoded, bufcoded);
 
     return decoded;
 }
@@ -2427,9 +2489,8 @@ AP_DECLARE(char *) ap_pbase64encode(apr_pool_t *p, char *string)
     char *encoded;
     int l = strlen(string);
 
-    encoded = (char *) apr_palloc(p, 1 + apr_base64_encode_len(l));
-    l = apr_base64_encode(encoded, string, l);
-    encoded[l] = '\0'; /* make binary sequence into string */
+    encoded = (char *) apr_palloc(p, apr_base64_encode_len(l));
+    apr_base64_encode(encoded, string, l);
 
     return encoded;
 }
@@ -2462,7 +2523,7 @@ AP_DECLARE(void) ap_content_type_tolower(char *str)
  */
 AP_DECLARE(char *) ap_escape_quotes(apr_pool_t *p, const char *instring)
 {
-    int newlen = 0;
+    apr_size_t size, extra = 0;
     const char *inchr = instring;
     char *outchr, *outstring;
 
@@ -2471,21 +2532,41 @@ AP_DECLARE(char *) ap_escape_quotes(apr_pool_t *p, const char *instring)
      * string up by an extra byte each time we find an unescaped ".
      */
     while (*inchr != '\0') {
-        newlen++;
         if (*inchr == '"') {
-            newlen++;
+            extra++;
         }
         /*
          * If we find a slosh, and it's not the last byte in the string,
          * it's escaping something - advance past both bytes.
          */
-        if ((*inchr == '\\') && (inchr[1] != '\0')) {
+        else if ((*inchr == '\\') && (inchr[1] != '\0')) {
             inchr++;
-            newlen++;
         }
         inchr++;
     }
-    outstring = apr_palloc(p, newlen + 1);
+
+    if (!extra) {
+        return apr_pstrdup(p, instring);
+    }
+
+    /* How large will the string become, once we escaped all the quotes?
+     * The tricky cases are
+     * - an `instring` that is already longer than `ptrdiff_t`
+     *   can hold (which is an undefined case in C, as C defines ptrdiff_t as
+     *   a signed difference between pointers into the same array and one index
+     *   beyond).
+     * - an `instring` that, including the `extra` chars we want to add, becomes
+     *   even larger than apr_size_t can handle.
+     * Since this function was not designed to ever return NULL for failure, we
+     * can only trigger a hard assertion failure. It seems more a programming
+     * mistake (or failure to verify the input causing this) that leads to this
+     * situation.
+     */
+    ap_assert(inchr - instring > 0);
+    size = ((apr_size_t)(inchr - instring)) + 1;
+    ap_assert(size + extra > size);
+
+    outstring = apr_palloc(p, size + extra);
     inchr = instring;
     outchr = outstring;
     /*
@@ -2493,16 +2574,13 @@ AP_DECLARE(char *) ap_escape_quotes(apr_pool_t *p, const char *instring)
      * in front of every " that doesn't already have one.
      */
     while (*inchr != '\0') {
-        if ((*inchr == '\\') && (inchr[1] != '\0')) {
-            *outchr++ = *inchr++;
-            *outchr++ = *inchr++;
-        }
         if (*inchr == '"') {
             *outchr++ = '\\';
         }
-        if (*inchr != '\0') {
+        else if ((*inchr == '\\') && (inchr[1] != '\0')) {
             *outchr++ = *inchr++;
         }
+        *outchr++ = *inchr++;
     }
     *outchr = '\0';
     return outstring;
@@ -2540,6 +2618,7 @@ AP_DECLARE(char *) ap_append_pid(apr_pool_t *p, const char *string,
  * in timeout_parameter.
  * @return Status value indicating whether the parsing was successful or not.
  */
+#define CHECK_OVERFLOW(a, b) if (a > b) return APR_EGENERAL
 AP_DECLARE(apr_status_t) ap_timeout_parameter_parse(
                                                const char *timeout_parameter,
                                                apr_interval_time_t *timeout,
@@ -2548,6 +2627,7 @@ AP_DECLARE(apr_status_t) ap_timeout_parameter_parse(
     char *endp;
     const char *time_str;
     apr_int64_t tout;
+    apr_uint64_t check;
 
     tout = apr_strtoi64(timeout_parameter, &endp, 10);
     if (errno) {
@@ -2560,24 +2640,32 @@ AP_DECLARE(apr_status_t) ap_timeout_parameter_parse(
         time_str = endp;
     }
 
+    if (tout < 0) { 
+        return APR_EGENERAL;
+    }
+
     switch (*time_str) {
         /* Time is in seconds */
     case 's':
-        *timeout = (apr_interval_time_t) apr_time_from_sec(tout);
+        CHECK_OVERFLOW(tout, apr_time_sec(APR_INT64_MAX));
+        check = apr_time_from_sec(tout);
         break;
-    case 'h':
         /* Time is in hours */
-        *timeout = (apr_interval_time_t) apr_time_from_sec(tout * 3600);
+    case 'h':
+        CHECK_OVERFLOW(tout, apr_time_sec(APR_INT64_MAX / 3600));
+        check = apr_time_from_sec(tout * 3600);
         break;
     case 'm':
         switch (*(++time_str)) {
         /* Time is in milliseconds */
         case 's':
-            *timeout = (apr_interval_time_t) tout * 1000;
+            CHECK_OVERFLOW(tout, apr_time_as_msec(APR_INT64_MAX));
+            check = apr_time_from_msec(tout);
             break;
         /* Time is in minutes */
         case 'i':
-            *timeout = (apr_interval_time_t) apr_time_from_sec(tout * 60);
+            CHECK_OVERFLOW(tout, apr_time_sec(APR_INT64_MAX / 60));
+            check = apr_time_from_sec(tout * 60);
             break;
         default:
             return APR_EGENERAL;
@@ -2586,8 +2674,11 @@ AP_DECLARE(apr_status_t) ap_timeout_parameter_parse(
     default:
         return APR_EGENERAL;
     }
+
+    *timeout = (apr_interval_time_t)check;
     return APR_SUCCESS;
 }
+#undef CHECK_OVERFLOW
 
 AP_DECLARE(int) ap_parse_strict_length(apr_off_t *len, const char *str)
 {
@@ -2712,7 +2803,7 @@ AP_DECLARE(int) ap_parse_form_data(request_rec *r, ap_filter_t *f,
 
     /* sanity check - we only support forms for now */
     ct = apr_table_get(r->headers_in, "Content-Type");
-    if (!ct || strncasecmp("application/x-www-form-urlencoded", ct, 33)) {
+    if (!ct || ap_cstr_casecmpn("application/x-www-form-urlencoded", ct, 33)) {
         return ap_discard_request_body(r);
     }
 
@@ -3042,7 +3133,7 @@ AP_DECLARE(apr_status_t) ap_varbuf_regsub(struct ap_varbuf *vb,
 static const char * const oom_message = "[crit] Memory allocation failed, "
                                         "aborting process." APR_EOL_STR;
 
-AP_DECLARE(void) ap_abort_on_oom()
+AP_DECLARE(void) ap_abort_on_oom(void)
 {
     int written, count = strlen(oom_message);
     const char *buf = oom_message;
@@ -3081,6 +3172,135 @@ AP_DECLARE(void *) ap_realloc(void *ptr, size_t size)
         ap_abort_on_oom();
     return p;
 }
+
+#if APR_HAS_THREADS
+
+#if APR_VERSION_AT_LEAST(1,8,0) && !defined(AP_NO_THREAD_LOCAL)
+
+#define ap_thread_current_create apr_thread_current_create
+
+#else /* APR_VERSION_AT_LEAST(1,8,0) && !defined(AP_NO_THREAD_LOCAL) */
+
+#if AP_HAS_THREAD_LOCAL
+
+struct thread_ctx {
+    apr_thread_start_t func;
+    void *data;
+};
+
+static AP_THREAD_LOCAL apr_thread_t *current_thread = NULL;
+
+static void *APR_THREAD_FUNC thread_start(apr_thread_t *thread, void *data)
+{
+    struct thread_ctx *ctx = data;
+
+    current_thread = thread;
+    return ctx->func(thread, ctx->data);
+}
+
+AP_DECLARE(apr_status_t) ap_thread_create(apr_thread_t **thread, 
+                                          apr_threadattr_t *attr, 
+                                          apr_thread_start_t func, 
+                                          void *data, apr_pool_t *pool)
+{
+    struct thread_ctx *ctx = apr_palloc(pool, sizeof(*ctx));
+
+    ctx->func = func;
+    ctx->data = data;
+    return apr_thread_create(thread, attr, thread_start, ctx, pool);
+}
+
+#endif /* AP_HAS_THREAD_LOCAL */
+
+AP_DECLARE(apr_status_t) ap_thread_current_create(apr_thread_t **current,
+                                                  apr_threadattr_t *attr,
+                                                  apr_pool_t *pool)
+{
+    apr_status_t rv;
+    apr_abortfunc_t abort_fn = apr_pool_abort_get(pool);
+    apr_allocator_t *allocator;
+    apr_os_thread_t osthd;
+    apr_pool_t *p;
+
+    *current = ap_thread_current();
+    if (*current) {
+        return APR_EEXIST;
+    }
+
+    rv = apr_allocator_create(&allocator);
+    if (rv != APR_SUCCESS) {
+        if (abort_fn)
+            abort_fn(rv);
+        return rv;
+    }
+    rv = apr_pool_create_unmanaged_ex(&p, abort_fn, allocator);
+    if (rv != APR_SUCCESS) {
+        apr_allocator_destroy(allocator);
+        return rv;
+    }
+    apr_allocator_owner_set(allocator, p);
+
+    osthd = apr_os_thread_current();
+    rv = apr_os_thread_put(current, &osthd, p);
+    if (rv != APR_SUCCESS) {
+        apr_pool_destroy(p);
+        return rv;
+    }
+
+#if AP_HAS_THREAD_LOCAL
+    current_thread = *current;
+#endif
+    return APR_SUCCESS;
+}
+
+AP_DECLARE(void) ap_thread_current_after_fork(void)
+{
+#if AP_HAS_THREAD_LOCAL
+    current_thread = NULL;
+#endif
+}
+
+AP_DECLARE(apr_thread_t *) ap_thread_current(void)
+{
+#if AP_HAS_THREAD_LOCAL
+    return current_thread;
+#else
+    return NULL;
+#endif
+}
+
+#endif /* APR_VERSION_AT_LEAST(1,8,0) && !defined(AP_NO_THREAD_LOCAL) */
+
+static apr_status_t main_thread_cleanup(void *arg)
+{
+    apr_thread_t *thd = arg;
+    apr_pool_destroy(apr_thread_pool_get(thd));
+    return APR_SUCCESS;
+}
+
+AP_DECLARE(apr_status_t) ap_thread_main_create(apr_thread_t **thread,
+                                               apr_pool_t *pool)
+{
+    apr_status_t rv;
+    apr_threadattr_t *attr = NULL;
+
+    /* Create an apr_thread_t for the main child thread to set up its Thread
+     * Local Storage. Since it's detached and won't apr_thread_exit(), destroy
+     * its pool before exiting via a cleanup of the given pool.
+     */
+    if ((rv = apr_threadattr_create(&attr, pool))
+            || (rv = apr_threadattr_detach_set(attr, 1))
+            || (rv = ap_thread_current_create(thread, attr, pool))) {
+        *thread = NULL;
+        return rv;
+    }
+
+    apr_pool_cleanup_register(pool, *thread, main_thread_cleanup,
+                              apr_pool_cleanup_null);
+    return APR_SUCCESS;
+}
+
+#endif /* APR_HAS_THREADS */
 
 AP_DECLARE(void) ap_get_sload(ap_sload_t *ld)
 {

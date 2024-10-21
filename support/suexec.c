@@ -127,15 +127,15 @@ static const char *const safe_env_lst[] =
     "REDIRECT_STATUS=",
     "REDIRECT_URL=",
     "REQUEST_METHOD=",
-    "REQUEST_URI=",
     "REQUEST_SCHEME=",
+    "REQUEST_URI=",
     "SCRIPT_FILENAME=",
     "SCRIPT_NAME=",
     "SCRIPT_URI=",
     "SCRIPT_URL=",
+    "SERVER_ADDR=",
     "SERVER_ADMIN=",
     "SERVER_NAME=",
-    "SERVER_ADDR=",
     "SERVER_PORT=",
     "SERVER_PROTOCOL=",
     "SERVER_SIGNATURE=",
@@ -502,7 +502,8 @@ int main(int argc, char *argv[])
      * and setgid() to the target group. If unsuccessful, error out.
      */
     if (((setgid(gid)) != 0) || (initgroups(actual_uname, gid) != 0)) {
-        log_err("failed to setgid (%lu: %s)\n", (unsigned long)gid, cmd);
+        log_err("failed to setgid/initgroups (%lu: %s): %s\n",
+                (unsigned long)gid, cmd, strerror(errno));
         exit(109);
     }
 
@@ -510,7 +511,8 @@ int main(int argc, char *argv[])
      * setuid() to the target user.  Error out on fail.
      */
     if ((setuid(uid)) != 0) {
-        log_err("failed to setuid (%lu: %s)\n", (unsigned long)uid, cmd);
+        log_err("failed to setuid (%lu: %s): %s\n",
+                (unsigned long)uid, cmd, strerror(errno));
         exit(110);
     }
 

@@ -680,7 +680,7 @@ static request_rec *internal_internal_redirect(const char *new_uri,
      * to do their thing on internal redirects as well.  Perhaps this is a
      * misnamed function.
      */
-    if ((access_status = ap_run_post_read_request(new))) {
+    if ((access_status = ap_post_read_request(new))) {
         ap_die(access_status, new);
         return NULL;
     }
@@ -708,7 +708,7 @@ AP_DECLARE(void) ap_internal_fast_redirect(request_rec *rr, request_rec *r)
     r->args = rr->args;
     r->finfo = rr->finfo;
     r->handler = rr->handler;
-    ap_set_content_type(r, rr->content_type);
+    ap_set_content_type_ex(r, rr->content_type, AP_REQUEST_IS_TRUSTED_CT(rr));
     r->content_encoding = rr->content_encoding;
     r->content_languages = rr->content_languages;
     r->per_dir_config = rr->per_dir_config;

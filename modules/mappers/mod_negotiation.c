@@ -774,7 +774,7 @@ static enum header_state get_header_line(char *buffer, int len, apr_file_t *map)
     /* We need to shortcut the rest of this block following the Body:
      * tag - we will not look for continutation after this line.
      */
-    if (!strncasecmp(buffer, "Body:", 5))
+    if (!ap_cstr_casecmpn(buffer, "Body:", 5))
         return header_seen;
 
     while (apr_file_getc(&c, map) != APR_EOF) {
@@ -1167,7 +1167,7 @@ static int read_types_multi(negotiation_state *neg)
          * might be doing.
          */
         if (sub_req->handler && !sub_req->content_type) {
-            ap_set_content_type(sub_req, CGI_MAGIC_TYPE);
+            ap_set_content_type_ex(sub_req, CGI_MAGIC_TYPE, 1);
         }
 
         /*
@@ -3003,14 +3003,14 @@ static int handle_map_file(request_rec *r)
         /* set MIME type and charset as negotiated */
         if (best->mime_type && *best->mime_type) {
             if (best->content_charset && *best->content_charset) {
-                ap_set_content_type(r, apr_pstrcat(r->pool,
+                ap_set_content_type_ex(r, apr_pstrcat(r->pool,
                                                    best->mime_type,
                                                    "; charset=",
                                                    best->content_charset,
-                                                   NULL));
+                                                   NULL), 1);
             }
             else {
-                ap_set_content_type(r, apr_pstrdup(r->pool, best->mime_type));
+                ap_set_content_type_ex(r, apr_pstrdup(r->pool, best->mime_type), 1);
             }
         }
 

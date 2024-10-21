@@ -18,6 +18,12 @@
 #include "apr_file_io.h"
 #include "apr_strings.h"
 #include "apr_buckets.h"
+
+#include "apr_version.h"
+#if !APR_VERSION_AT_LEAST(2,0,0)
+#include "apu_version.h"
+#endif
+
 #include "httpd.h"
 #include "http_config.h"
 #include "http_log.h"
@@ -471,6 +477,7 @@ static int open_entity(cache_handle_t *h, request_rec *r, const char *key)
      * about for the lifetime of the response.
      */
     apr_pool_create(&sobj->pool, r->pool);
+    apr_pool_tag(sobj->pool, "mod_cache_socache (open_entity)");
 
     sobj->buffer = apr_palloc(sobj->pool, dconf->max);
     sobj->buffer_len = dconf->max;
@@ -800,6 +807,7 @@ static apr_status_t store_headers(cache_handle_t *h, request_rec *r,
                     : obj->info.expire + dconf->mintime;
 
     apr_pool_create(&sobj->pool, r->pool);
+    apr_pool_tag(sobj->pool, "mod_cache_socache (store_headers)");
 
     sobj->buffer = apr_palloc(sobj->pool, dconf->max);
     sobj->buffer_len = dconf->max;

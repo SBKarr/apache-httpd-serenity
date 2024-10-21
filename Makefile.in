@@ -21,7 +21,7 @@ INSTALL_TARGETS = install-conf install-htdocs install-error install-icons \
 DISTCLEAN_TARGETS  = include/ap_config_auto.h include/ap_config_layout.h \
 	include/apache_probes.h \
 	modules.c config.cache config.log config.status build/config_vars.mk \
-	build/rules.mk docs/conf/httpd.conf docs/conf/extra/*.conf shlibtool \
+	build/rules.mk docs/conf/httpd.conf shlibtool \
 	build/pkg/pkginfo build/config_vars.sh
 EXTRACLEAN_TARGETS = configure include/ap_config_auto.h.in generated_lists \
 	httpd.spec
@@ -128,7 +128,7 @@ install-conf:
 	fi
 
 # Create a sanitized config_vars.mk
-build/config_vars.out: build/config_vars.mk
+build/config_vars.out: build/config_vars.mk build/config_vars.sh
 	@$(SHELL) build/config_vars.sh < build/config_vars.mk > build/config_vars.out
 
 install-build: build/config_vars.out
@@ -148,11 +148,25 @@ install-build: build/config_vars.out
 htdocs-srcdir = $(top_srcdir)/docs/docroot
 
 docs:
-	@if test -d $(top_srcdir)/docs/manual/build; then \
-	    cd $(top_srcdir)/docs/manual/build && ./build.sh all; \
-	else \
-	    echo 'For details on generating the docs, please read:'; \
-	    echo '  http://httpd.apache.org/docs-project/docsformat.html'; \
+
+update-changes:
+	@for i in `find changes-entries -type f`; do \
+	    cp CHANGES CHANGES.tmp ; \
+	    awk -v fname=$$i 'BEGIN{done = 0; active = 0} \
+	                    done == 0 && active == 0 && /^Changes with Apache /{ active = 1; print; next}; \
+	                    /^( *\*|Changes with Apache )/ && active == 1 && done == 0{rec=$$0; while(getline<fname){if (! ($$0 ~ /^ *$$/)){print}}printf "\n";print rec; active = 0; done = 1; next} //;' \
+	    CHANGES.tmp > CHANGES ; \
+	    rm CHANGES.tmp ; \
+	    if [ -n "$(SVN)" ] ; then \
+	        if ! $(SVN) rm $$i 2>/dev/null ; then \
+	            $(RM) $$i ; \
+	        fi ; \
+	    else \
+	        $(RM) $$i ; \
+	    fi ; \
+	done ; \
+	if [ -n "$(SVN)" ] ; then \
+	    $(SVN) diff CHANGES ; \
 	fi
 
 validate-xml:
@@ -164,7 +178,6 @@ validate-xml:
 	fi
 
 dox:
-	doxygen $(top_srcdir)/docs/doxygen.conf
 
 install-htdocs:
 	-@if [ -d $(DESTDIR)$(htdocsdir) ]; then \
@@ -201,14 +214,6 @@ install-icons:
 	fi
 
 install-cgi:
-	-@if [ -d $(DESTDIR)$(cgidir) ];then \
-	    echo "[PRESERVING EXISTING CGI SUBDIR: $(DESTDIR)$(cgidir)]"; \
-	else \
-	   echo Installing CGIs ; \
-	   $(MKINSTALLDIRS) $(DESTDIR)$(cgidir) ; \
-	   cd $(top_srcdir)/docs/cgi-examples && cp -rp * $(DESTDIR)$(cgidir) ; \
-	   test "x$(cgidir)" != "x" && cd $(DESTDIR)$(cgidir) && find . -name ".svn" -type d -print | xargs rm -rf 2>/dev/null || true; \
-	fi
 
 install-other:
 	@test -d $(DESTDIR)$(logfiledir) || $(MKINSTALLDIRS) $(DESTDIR)$(logfiledir)
@@ -234,8 +239,11 @@ INSTALL_HEADERS = \
 	$(srcdir)/modules/cache/mod_cache.h \
 	$(srcdir)/modules/cache/cache_common.h \
 	$(srcdir)/modules/database/mod_dbd.h \
+	$(srcdir)/modules/http2/mod_http2.h \
 	$(srcdir)/modules/filters/mod_include.h \
 	$(srcdir)/modules/filters/mod_xml2enc.h \
+	$(srcdir)/modules/generators/mod_cgi.h \
+	$(srcdir)/modules/generators/mod_status.h \
 	$(srcdir)/modules/loggers/mod_log_config.h \
 	$(srcdir)/modules/mappers/mod_rewrite.h \
 	$(srcdir)/modules/proxy/mod_proxy.h \
@@ -251,7 +259,6 @@ install-include:
 	done
 
 install-man:
-	@echo Installing man pages and online manual
 
 install-suexec: install-suexec-$(INSTALL_SUEXEC)
 

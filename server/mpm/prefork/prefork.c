@@ -223,6 +223,10 @@ static void clean_child_exit(int code)
     apr_signal(SIGHUP, SIG_IGN);
     apr_signal(SIGTERM, SIG_IGN);
 
+    if (code == 0) {
+        ap_run_child_stopping(pchild, 0);
+    }
+
     if (pchild) {
         apr_pool_destroy(pchild);
     }
@@ -376,11 +380,22 @@ static void stop_listening(int sig)
 static int requests_this_child;
 static int num_listensocks = 0;
 
+#if APR_HAS_THREADS
+static void child_sigmask(sigset_t *new_mask, sigset_t *old_mask)
+{
+#if defined(SIGPROCMASK_SETS_THREAD_MASK)
+    sigprocmask(SIG_SETMASK, new_mask, old_mask);
+#else
+    pthread_sigmask(SIG_SETMASK, new_mask, old_mask);
+#endif
+}
+#endif
+
 static void child_main(int child_num_arg, int child_bucket)
 {
 #if APR_HAS_THREADS
     apr_thread_t *thd = NULL;
-    apr_os_thread_t osthd;
+    sigset_t sig_mask;
 #endif
     apr_pool_t *ptrans;
     apr_allocator_t *allocator;
@@ -411,9 +426,23 @@ static void child_main(int child_num_arg, int child_bucket)
     apr_allocator_owner_set(allocator, pchild);
     apr_pool_tag(pchild, "pchild");
 
+#if AP_HAS_THREAD_LOCAL
+    if (one_process) {
+        thd = ap_thread_current();
+    }
+    else if ((status = ap_thread_main_create(&thd, pchild))) {
+        ap_log_error(APLOG_MARK, APLOG_EMERG, status, ap_server_conf, APLOGNO(10378)
+                     "Couldn't initialize child main thread");
+        clean_child_exit(APEXIT_CHILDFATAL);
+    }
+#elif APR_HAS_THREADS
+    {
+        apr_os_thread_t osthd = apr_os_thread_current();
+        apr_os_thread_put(&thd, &osthd, pchild);
+    }
+#endif
 #if APR_HAS_THREADS
-    osthd = apr_os_thread_current();
-    apr_os_thread_put(&thd, &osthd, pchild);
+    ap_assert(thd != NULL);
 #endif
 
     apr_pool_create(&ptrans, pchild);
@@ -446,7 +475,30 @@ static void child_main(int child_num_arg, int child_bucket)
         clean_child_exit(APEXIT_CHILDFATAL);
     }
 
+#if APR_HAS_THREADS
+    /* Save the signal mask and block all the signals from being received by
+     * threads potentially created in child_init() hooks (e.g. mod_watchdog).
+     */
+    child_sigmask(NULL, &sig_mask);
+    {
+        apr_status_t rv;
+        rv = apr_setup_signal_thread();
+        if (rv != APR_SUCCESS) {
+            ap_log_error(APLOG_MARK, APLOG_EMERG, rv, ap_server_conf, APLOGNO(10271)
+                         "Couldn't initialize signal thread");
+            clean_child_exit(APEXIT_CHILDFATAL);
+        }
+    }
+#endif /* APR_HAS_THREADS */
+
     ap_run_child_init(pchild, ap_server_conf);
+
+#if APR_HAS_THREADS
+    /* Restore the original signal mask for this main thread, the only one
+     * that should possibly get interrupted by signals.
+     */
+    child_sigmask(&sig_mask, NULL);
+#endif
 
     ap_create_sb_handle(&sbh, pchild, my_child_num, 0);
 
@@ -683,6 +735,10 @@ static int make_child(server_rec *s, int slot)
     }
 
     if (!pid) {
+#if AP_HAS_THREAD_LOCAL
+        ap_thread_current_after_fork();
+#endif
+
         my_bucket = &all_buckets[bucket];
 
 #ifdef HAVE_BINDPROCESSOR
@@ -1249,7 +1305,6 @@ static int prefork_pre_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp
     if (!retained) {
         retained = ap_retained_data_create(userdata_key, sizeof(*retained));
         retained->mpm = ap_unixd_mpm_get_retained_data();
-        retained->max_daemons_limit = -1;
         retained->idle_spawn_rate = 1;
     }
     retained->mpm->mpm_state = AP_MPMQ_STARTING;
@@ -1263,7 +1318,7 @@ static int prefork_pre_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp
     if (retained->mpm->module_loads == 2) {
         if (!one_process && !foreground) {
             /* before we detach, setup crash handlers to log to errorlog */
-            ap_fatal_signal_setup(ap_server_conf, pconf);
+            ap_fatal_signal_setup(ap_server_conf, p /* == pconf */);
             rv = apr_proc_detach(no_detach ? APR_PROC_DETACH_FOREGROUND
                                            : APR_PROC_DETACH_DAEMONIZE);
             if (rv != APR_SUCCESS) {

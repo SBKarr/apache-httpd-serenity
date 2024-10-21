@@ -179,8 +179,10 @@ static int scgi_canon(request_rec *r, char *url)
     char *host, sport[sizeof(":65535")];
     const char *err, *path;
     apr_port_t port, def_port;
+    core_dir_config *d = ap_get_core_module_config(r->per_dir_config);
+    int flags = d->allow_encoded_slashes && !d->decode_encoded_slashes ? PROXY_CANONENC_NOENCODEDSLASHENCODING : 0;
 
-    if (strncasecmp(url, SCHEME "://", sizeof(SCHEME) + 2)) {
+    if (ap_cstr_casecmpn(url, SCHEME "://", sizeof(SCHEME) + 2)) {
         return DECLINED;
     }
     url += sizeof(SCHEME); /* Keep slashes */
@@ -205,8 +207,8 @@ static int scgi_canon(request_rec *r, char *url)
         host = apr_pstrcat(r->pool, "[", host, "]", NULL);
     }
 
-    path = ap_proxy_canonenc(r->pool, url, strlen(url), enc_path, 0,
-                             r->proxyreq);
+    path = ap_proxy_canonenc_ex(r->pool, url, strlen(url), enc_path, flags,
+                                r->proxyreq);
     if (!path) {
         return HTTP_BAD_REQUEST;
     }
@@ -388,6 +390,14 @@ static int pass_response(request_rec *r, proxy_conn_rec *conn)
         return status;
     }
 
+    /* SCGI has its own body framing mechanism which we don't
+     * match against any provided Content-Length, so let the
+     * core determine C-L vs T-E based on what's actually sent.
+     */
+    if (!apr_table_get(r->subprocess_env, AP_TRUST_CGILIKE_CL_ENVVAR))
+        apr_table_unset(r->headers_out, "Content-Length");
+    apr_table_unset(r->headers_out, "Transfer-Encoding");
+
     conf = ap_get_module_config(r->per_dir_config, &proxy_scgi_module);
     if (conf->sendfile && conf->sendfile != scgi_sendfile_off) {
         short err = 1;
@@ -434,7 +444,7 @@ static int pass_response(request_rec *r, proxy_conn_rec *conn)
         if (location && *location == '/') {
             scgi_request_config *req_conf = apr_palloc(r->pool,
                                                        sizeof(*req_conf));
-            if (strcasecmp(location_header, "Location")) {
+            if (ap_cstr_casecmp(location_header, "Location")) {
                 if (err) {
                     apr_table_unset(r->err_headers_out, location_header);
                 }
@@ -533,7 +543,7 @@ static int scgi_handler(request_rec *r, proxy_worker *worker,
     apr_uri_t *uri;
     char dummy;
 
-    if (strncasecmp(url, SCHEME "://", sizeof(SCHEME) + 2)) {
+    if (ap_cstr_casecmpn(url, SCHEME "://", sizeof(SCHEME) + 2)) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(00865)
                       "declining URL %s", url);
         return DECLINED;
